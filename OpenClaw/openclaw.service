@@ -1,0 +1,26 @@
+[Unit]
+Description=OpenClaw Gateway
+Documentation=https://learnopenclaw.com/
+After=network.target bluetooth.target pulseaudio.service
+Wants=bluetooth.target pulseaudio.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi
+Environment=HOME=/home/pi
+Environment=NVM_DIR=/home/pi/.nvm
+
+# nvm-managed Node.js — resolve the actual binary path at start
+ExecStartPre=/bin/bash -c 'source $NVM_DIR/nvm.sh && nvm use default'
+ExecStart=/bin/bash -c 'source $NVM_DIR/nvm.sh && openclaw start'
+
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw
+
+[Install]
+WantedBy=multi-user.target
