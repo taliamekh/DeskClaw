@@ -3,57 +3,124 @@ import threading
 import time
 import subprocess
 import os
+import re
 
 # Global variables for audio
 audio_level = 0
 audio_active = True
 mic_available = False
 
-def check_microphone():
-    """Check if microphone is available using arecord"""
+# YOLO detection (simple version without ultralytics dependency)
+def detect_objects_simple(frame):
+    """Simple object detection using OpenCV's built-in methods"""
+    # Convert to grayscale for contour detection
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Gaussian blur
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Edge detection
+    edges = cv2.Canny(blurred, 50, 150)
+    
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    detections = []
+    for contour in contours:
+        # Filter small contours
+        area = cv2.contourArea(contour)
+        if area > 1000:  # Minimum area threshold
+            x, y, w, h = cv2.boundingRect(contour)
+            # Filter by aspect ratio and size
+            if w > 30 and h > 30 and w < 400 and h < 400:
+                detections.append({
+                    'bbox': [x, y, x+w, y+h],
+                    'confidence': min(area / 10000, 1.0),  # Rough confidence based on area
+                    'label': 'object'
+                })
+    
+    return detections
+
+def get_audio_devices():
+    """Get list of audio input devices"""
     try:
-        # Test if arecord (ALSA) is available
-        result = subprocess.run(['arecord', '--list-devices'], 
-                              capture_output=True, text=True, timeout=5)
-        return result.returncode == 0
+        result = subprocess.run(['arecord', '-l'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            # Parse device information
+            devices = []
+            lines = result.stdout.split('\n')
+            for line in lines:
+                if 'card' in line and 'device' in line:
+                    # Extract card and device numbers
+                    match = re.search(r'card (\d+):.*device (\d+):', line)
+                    if match:
+                        card = match.group(1)
+                        device = match.group(2)
+                        devices.append(f"plughw:{card},{device}")
+            return devices
+    except:
+        pass
+    return ['default', 'plughw:1,0', 'plughw:0,0']
+
+def test_audio_device(device):
+    """Test if an audio device works"""
+    try:
+        cmd = ['arecord', '-D', device, '-d', '0.1', '-f', 'S16_LE', '-r', '44100', '-c', '1', '-t', 'raw']
+        result = subprocess.run(cmd, capture_output=True, timeout=2)
+        return result.returncode == 0 and len(result.stdout) > 0
     except:
         return False
 
 def audio_test_alsa():
-    """Test microphone using ALSA arecord (Raspberry Pi friendly)"""
+    """Test microphone using ALSA arecord with better device detection"""
     global audio_level, audio_active, mic_available
     
-    if not check_microphone():
-        print("No microphone detected via ALSA")
+    print("Detecting audio devices...")
+    devices = get_audio_devices()
+    working_device = None
+    
+    # Test each device to find a working one
+    for device in devices:
+        print(f"Testing audio device: {device}")
+        if test_audio_device(device):
+            working_device = device
+            print(f"Found working audio device: {device}")
+            break
+    
+    if not working_device:
+        print("No working audio device found")
         mic_available = False
         return
     
     mic_available = True
-    print("Microphone detected - using ALSA")
+    print(f"Using audio device: {working_device}")
     
     try:
         while audio_active:
             try:
                 # Use arecord to capture a short audio sample
-                cmd = ['arecord', '-D', 'plughw:1,0', '-d', '0.1', '-f', 'S16_LE', '-r', '44100', '-c', '1', '-t', 'raw']
+                cmd = ['arecord', '-D', working_device, '-d', '0.1', '-f', 'S16_LE', '-r', '44100', '-c', '1', '-t', 'raw']
+                result = subprocess.run(cmd, capture_output=True, timeout=1)
                 
-                # Try different device indices if default doesn't work
-                for device in ['plughw:1,0', 'plughw:0,0', 'default']:
-                    try:
-                        cmd[2] = device
-                        result = subprocess.run(cmd, capture_output=True, timeout=1)
-                        if result.returncode == 0:
-                            # Calculate simple audio level from raw data length
-                            data_length = len(result.stdout)
-                            # Normalize to 0-100 scale (rough approximation)
-                            audio_level = min(int(data_length / 100), 100)
-                            break
-                    except:
-                        continue
+                if result.returncode == 0 and len(result.stdout) > 0:
+                    # Calculate audio level from raw data
+                    data = result.stdout
+                    if len(data) > 0:
+                        # Convert bytes to integers and calculate RMS-like value
+                        samples = [abs(int.from_bytes(data[i:i+2], 'little', signed=True)) for i in range(0, len(data)-1, 2)]
+                        if samples:
+                            avg_amplitude = sum(samples) / len(samples)
+                            # Normalize to 0-100 scale
+                            audio_level = min(int(avg_amplitude / 300), 100)  # Adjust divisor as needed
+                        else:
+                            audio_level = 0
+                    else:
+                        audio_level = 0
                 else:
                     audio_level = 0
                     
             except Exception as e:
+                print(f"Audio read error: {e}")
                 audio_level = 0
             
             time.sleep(0.1)  # Update every 100ms
@@ -114,12 +181,36 @@ def audio_test_pyaudio():
         p.terminate()
         
     except ImportError:
-        print("PyAudio not available, falling back to ALSA")
+        print("PyAudio not available, using ALSA")
         audio_test_alsa()
     except Exception as e:
         print(f"PyAudio initialization failed: {e}")
-        print("Falling back to ALSA method")
+        print("Using ALSA method")
         audio_test_alsa()
+
+def draw_detections(frame, detections):
+    """Draw bounding boxes on detected objects"""
+    for detection in detections:
+        x1, y1, x2, y2 = map(int, detection['bbox'])
+        confidence = detection['confidence']
+        label = detection['label']
+        
+        # Draw bounding box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        # Draw label with confidence
+        label_text = f"{label}: {confidence:.2f}"
+        label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+        
+        # Background rectangle for text
+        cv2.rectangle(frame, (x1, y1 - label_size[1] - 10), 
+                     (x1 + label_size[0], y1), (0, 255, 0), -1)
+        
+        # Text
+        cv2.putText(frame, label_text, (x1, y1 - 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    
+    return frame
 
 def draw_audio_meter(frame, level, available):
     """Draw audio level meter on the frame"""
@@ -155,13 +246,14 @@ def draw_audio_meter(frame, level, available):
 def main():
     global audio_active, mic_available
     
-    print("OpenClaw Camera & Microphone Test")
+    print("OpenClaw Camera & Microphone Test with Object Detection")
     print("Controls:")
     print("- ESC: Exit")
     print("- 'm': Toggle microphone test")
+    print("- 'd': Toggle object detection")
     print("- 's': Take screenshot")
     print("- 'i': Show system info")
-    print("=" * 40)
+    print("=" * 50)
     
     # Initialize camera
     cap = cv2.VideoCapture(0)
@@ -179,6 +271,7 @@ def main():
     
     # Start audio test in separate thread
     mic_enabled = True
+    detection_enabled = True
     audio_thread = threading.Thread(target=audio_test_pyaudio, daemon=True)
     audio_thread.start()
     
@@ -193,8 +286,14 @@ def main():
         
         frame_count += 1
         
-        # Add frame counter
-        cv2.putText(frame, f"Frame: {frame_count}", (20, 30), 
+        # Object detection
+        detections = []
+        if detection_enabled:
+            detections = detect_objects_simple(frame)
+            frame = draw_detections(frame, detections)
+        
+        # Add frame counter and detection count
+        cv2.putText(frame, f"Frame: {frame_count} | Objects: {len(detections)}", (20, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # Add microphone level meter if enabled
@@ -202,6 +301,7 @@ def main():
             draw_audio_meter(frame, audio_level, mic_available)
         
         # Add status text
+        status_y = frame.shape[0] - 40
         if mic_available:
             status_text = "Mic: ON" if mic_enabled else "Mic: OFF"
             color = (0, 255, 0) if mic_enabled else (0, 0, 255)
@@ -209,8 +309,14 @@ def main():
             status_text = "Mic: N/A"
             color = (0, 0, 255)
             
-        cv2.putText(frame, status_text, (20, frame.shape[0] - 20), 
+        cv2.putText(frame, status_text, (20, status_y), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        # Detection status
+        det_text = "Detection: ON" if detection_enabled else "Detection: OFF"
+        det_color = (0, 255, 0) if detection_enabled else (0, 0, 255)
+        cv2.putText(frame, det_text, (20, frame.shape[0] - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, det_color, 2)
         
         # Display frame
         cv2.imshow("OpenClaw Camera & Mic Test", frame)
@@ -223,6 +329,9 @@ def main():
         elif key == ord('m'):  # Toggle microphone
             mic_enabled = not mic_enabled
             print(f"Microphone display {'enabled' if mic_enabled else 'disabled'}")
+        elif key == ord('d'):  # Toggle detection
+            detection_enabled = not detection_enabled
+            print(f"Object detection {'enabled' if detection_enabled else 'disabled'}")
         elif key == ord('s'):  # Screenshot
             screenshot_count += 1
             filename = f"screenshot_{screenshot_count:03d}.jpg"
@@ -234,6 +343,7 @@ def main():
             print(f"Camera resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
             print(f"Camera FPS: {cap.get(cv2.CAP_PROP_FPS)}")
             print(f"Microphone available: {mic_available}")
+            print(f"Current audio level: {audio_level}%")
             
             # Check audio devices
             try:
