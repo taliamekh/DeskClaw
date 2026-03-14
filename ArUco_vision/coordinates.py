@@ -15,19 +15,16 @@ CORNER_IDS = {
 }
 
 # Physical size of your printed markers in meters (4 inches = ~0.1016m)
-MARKER_SIZE = 0.1016
+MARKER_SIZE = 0.1016/2
 
 # Camera index (0 = default webcam)
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 
 # Your camera intrinsics — replace with your calibrated values if you have them
 # These are rough defaults for a typical 720p webcam
-CAMERA_MATRIX = np.array([
-    [800,   0, 640],
-    [  0, 800, 360],
-    [  0,   0,   1]
-], dtype=np.float32)
-DIST_COEFFS = np.zeros((4, 1), dtype=np.float32)
+cal = np.load("camera_calibration.npz")
+CAMERA_MATRIX = cal['camera_matrix']
+DIST_COEFFS = cal['dist_coeffs']
 
 # ─────────────────────────────────────────────
 # SETUP
