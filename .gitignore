@@ -1,6 +1,10 @@
 .env/
 .env
 venv/
+.venv
 node_modules/
 output/
 *.mp3
+.kiro/
+uv.lock
+env
