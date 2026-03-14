@@ -9,22 +9,23 @@ import time
 
 # Checkerboard dimensions — number of INNER corners (not squares)
 # e.g. a standard 8x6 checkerboard has 7x5 inner corners
-CHECKERBOARD = (7, 5)
+CHECKERBOARD = (8, 5)
 
 # Size of each square in meters (measure your printed checkerboard)
-SQUARE_SIZE = 0.015  # 2.5cm default
+SQUARE_SIZE = 0.024
 
 # How many good captures to collect before calibrating
 TARGET_CAPTURES = 20
 
 # Minimum seconds between auto-captures (to avoid duplicates)
-CAPTURE_INTERVAL = 1.5
+CAPTURE_INTERVAL = 1.5# e.g. a standard 8x6 checkerboard has 7x5 inner corners
 
 # Camera index
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 
 # Where to save the calibration result
-OUTPUT_FILE = "camera_calibration.npz"
+OUTPUT_FILE = "camera_calibration.npz"  # 2.5cm default
+
 
 # ─────────────────────────────────────────────
 # SETUP
@@ -41,8 +42,9 @@ img_points = []  # 2D image points
 criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
 cap = cv2.VideoCapture(CAMERA_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+cap.set(cv2.CAP_PROP_ZOOM, 1.0)  # force no zoom
+# cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 print("=" * 50)
 print("  Camera Calibration Tool")
