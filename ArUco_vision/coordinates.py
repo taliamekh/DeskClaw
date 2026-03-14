@@ -15,7 +15,7 @@ CORNER_IDS = {
 
 ROBOT_MARKER_ID = 4  # ID of the marker on the robot
 
-MARKER_SIZE = 0.1016  # 4 inches in meters
+MARKER_SIZE = 0.0508  # 2 inches in meters
 CAMERA_INDEX = 2
 
 # Load calibration from file
