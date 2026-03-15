@@ -35,12 +35,15 @@ class RoverDrive:
             GPIO.output(pin, GPIO.LOW)
 
     def _set_motors(self, left_fwd, left_bwd, right_fwd, right_bwd, speed=None):
-        # IN1/IN2 (GPIO 27/17) → right motor (inverted: HIGH=backward)
-        # IN3/IN4 (GPIO 24/23) → left motor (inverted: HIGH=backward)
-        GPIO.output(IN1, GPIO.HIGH if right_bwd else GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH if right_fwd else GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH if left_bwd else GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH if left_fwd else GPIO.LOW)
+        # Actual wiring (verified by testing):
+        # IN2 (GPIO 17) = OUT1/2 (left motor) forward
+        # IN1 (GPIO 27) = OUT1/2 (left motor) backward
+        # IN4 (GPIO 23) = OUT3/4 (right motor) forward
+        # IN3 (GPIO 24) = OUT3/4 (right motor) backward
+        GPIO.output(IN1, GPIO.HIGH if left_bwd else GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH if left_fwd else GPIO.LOW)
+        GPIO.output(IN3, GPIO.HIGH if right_bwd else GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH if right_fwd else GPIO.LOW)
 
     # --- Movement primitives ---
 
