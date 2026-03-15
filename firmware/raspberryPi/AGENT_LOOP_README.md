@@ -24,6 +24,22 @@ In `basic_agent_loop.py`:
 Those two methods are intentionally boilerplate placeholders right now.
 Put your real motor/servo drive calls there.
 
+## Arduino drive serial protocol
+
+`basic_agent_loop.py` now supports direct serial movement commands:
+
+- `d<number>` => forward motion duration in 100 ms ticks
+- `l<number>` / `r<number>` => left/right turn units, clamped to `1..1000`
+
+Config fields in `pi_agent_config.json`:
+
+- `drive.serial_port`
+- `drive.baud`
+- `drive.forward_step_cm`
+- `drive.turn_min_abs_deg`
+- `drive.turn_units_per_deg`
+- `drive.command_cooldown_sec`
+
 ## Files
 
 - `basic_agent_loop.py` - main loop

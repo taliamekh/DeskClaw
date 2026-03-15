@@ -30,8 +30,15 @@
   },
   "pickup": {
 	"dry_run": true,
-	"serial_port": "/dev/ttyUSB0",
+	"serial_port": "/dev/uno_arm",
 	"camera_index": 0
+  },
+  "drive": {
+	"serial_port": "/dev/uno_drive",
+	"baud": 9600,
+	"forward_step_cm": 10.0,
+	"turn_min_abs_deg": 10.0,
+	"turn_units_per_deg": 5.0,
+	"command_cooldown_sec": 0.15
   }
 }
-

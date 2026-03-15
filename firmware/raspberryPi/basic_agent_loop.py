@@ -11,6 +11,7 @@ Flow:
 
 import argparse
 import asyncio
+import glob
 import json
 import os
 import re
@@ -50,6 +51,12 @@ class AgentConfig:
     dry_run_pickup: bool = True
     serial_port: str = "/dev/ttyUSB0"
     camera_index: int = 0
+    drive_serial_port: str = "auto"
+    drive_serial_baud: int = 9600
+    drive_forward_step_cm: float = 10.0
+    drive_turn_min_abs_deg: float = 10.0
+    drive_turn_units_per_deg: float = 5.0
+    drive_command_cooldown_sec: float = 0.15
 
 
 def load_config(path: str) -> AgentConfig:
@@ -75,7 +82,91 @@ def load_config(path: str) -> AgentConfig:
         dry_run_pickup=bool(raw.get("pickup", {}).get("dry_run", True)),
         serial_port=raw.get("pickup", {}).get("serial_port", "/dev/ttyUSB0"),
         camera_index=int(raw.get("pickup", {}).get("camera_index", 0)),
+        drive_serial_port=raw.get("drive", {}).get("serial_port", "auto"),
+        drive_serial_baud=int(raw.get("drive", {}).get("baud", 9600)),
+        drive_forward_step_cm=float(raw.get("drive", {}).get("forward_step_cm", 10.0)),
+        drive_turn_min_abs_deg=float(raw.get("drive", {}).get("turn_min_abs_deg", 10.0)),
+        drive_turn_units_per_deg=float(raw.get("drive", {}).get("turn_units_per_deg", 5.0)),
+        drive_command_cooldown_sec=float(raw.get("drive", {}).get("command_cooldown_sec", 0.15)),
     )
+
+
+class ArduinoDriveBridge:
+    """Sends movement commands to Arduino over serial.
+
+    Protocol:
+    - d<number>: forward duration ticks, where each tick is 100 ms
+    - l<number> or r<number>: turn left/right units (1..1000)
+    """
+
+    def __init__(self, port: str, baud: int):
+        self.port = port
+        self.baud = baud
+        self._serial = None
+
+    def _candidate_ports(self) -> List[str]:
+        configured = (self.port or "").strip()
+        if configured and configured.lower() != "auto":
+            return [configured]
+
+        candidates: List[str] = []
+
+        # Common USB serial names on Linux/Raspberry Pi.
+        candidates.extend(sorted(glob.glob("/dev/ttyACM*")))
+        candidates.extend(sorted(glob.glob("/dev/ttyUSB*")))
+
+        # Optional pyserial discovery (works on Linux/macOS/Windows).
+        try:
+            from serial.tools import list_ports  # type: ignore[import-not-found]
+
+            discovered = [p.device for p in list_ports.comports() if p.device]
+            for dev in discovered:
+                if dev not in candidates:
+                    candidates.append(dev)
+        except Exception:
+            pass
+
+        # Windows-style fallback names.
+        for i in range(1, 21):
+            com = f"COM{i}"
+            if com not in candidates:
+                candidates.append(com)
+
+        return candidates
+
+    def connect(self) -> None:
+        try:
+            import serial  # type: ignore[import-not-found]  # Lazy import for environments without pyserial.
+
+            for candidate in self._candidate_ports():
+                try:
+                    self._serial = serial.Serial(candidate, self.baud, timeout=1)
+                    self.port = candidate
+                    time.sleep(2)
+                    print(f"Drive serial connected: {candidate} @ {self.baud}")
+                    return
+                except Exception:
+                    self._serial = None
+
+            print("[warn] drive serial unavailable: no candidate port opened")
+        except Exception as exc:
+            self._serial = None
+            print(f"[warn] drive serial unavailable: {exc}")
+
+    def close(self) -> None:
+        if self._serial is not None:
+            self._serial.close()
+            self._serial = None
+
+    def send_command(self, command: str) -> bool:
+        if self._serial is None:
+            return False
+        try:
+            self._serial.write(f"{command.strip()}\n".encode("utf-8"))
+            return True
+        except Exception as exc:
+            print(f"[warn] drive serial write failed: {exc}")
+            return False
 
 
 class VisionApiClient:
@@ -125,7 +216,7 @@ class VisionApiClient:
         return response.json()
 
 
-def parse_intent(command_text: str) -> Dict[str, Optional[str]]:
+def parse_intent(command_text: str) -> Dict[str, Any]:
     text = command_text.strip().lower()
     action = None
     bring_back = any(p in text for p in ["bring it", "bring back", "bring it back", "return with it"])
@@ -156,7 +247,7 @@ def parse_intent(command_text: str) -> Dict[str, Optional[str]]:
             corner = token.replace(" ", "_")
             break
 
-    coord_match = re.search(r"(?:x\s*[:=]?\s*(-?\d+(?:\.\d+)?)\D+y\s*[:=]?\s*(-?\d+(?:\.\d+)?))", text)
+    coord_match = re.search(r"x\s*[:=]?\s*(-?\d+(?:\.\d+)?)\D+y\s*[:=]?\s*(-?\d+(?:\.\d+)?)", text)
     if coord_match:
         coord = {
             "x": float(coord_match.group(1)),
@@ -223,7 +314,7 @@ class LabelResolver:
             "Return strict JSON only, either: "
             '{"goal_type":"corner","corner":"top_left|top_right|bottom_right|bottom_left"} '
             "or "
-            '{"goal_type":"point","mode":"cm","x":number,"y":number}."
+            "{\"goal_type\":\"point\",\"mode\":\"cm\",\"x\":number,\"y\":number}."
         )
         payload = {
             "model": self.cfg.llm_model,
@@ -378,9 +469,25 @@ class PickupRunner:
 class VoicePickupAgent:
     def __init__(self, cfg: AgentConfig):
         self.cfg = cfg
+        self._validate_serial_ports()
         self.vision = VisionApiClient(cfg.vision_api_base)
         self.resolver = LabelResolver(cfg)
         self.pickup = PickupRunner(cfg)
+        self.drive = ArduinoDriveBridge(cfg.drive_serial_port, cfg.drive_serial_baud)
+        self._last_drive_cmd_ts = 0.0
+
+    def _validate_serial_ports(self) -> None:
+        """Fail fast if drive and arm are pointed to the same explicit serial device."""
+        drive_port = (self.cfg.drive_serial_port or "").strip()
+        arm_port = (self.cfg.serial_port or "").strip()
+        if not drive_port or not arm_port:
+            return
+
+        if drive_port.lower() != "auto" and os.path.realpath(drive_port) == os.path.realpath(arm_port):
+            raise ValueError(
+                f"Drive and arm serial ports resolve to the same device ({drive_port}). "
+                "Use separate aliases such as /dev/uno_drive and /dev/uno_arm."
+            )
 
     @staticmethod
     def _contains_wake_phrase(text: str, wake_phrase: str) -> bool:
@@ -395,6 +502,7 @@ class VoicePickupAgent:
         return text[idx + len(wake_phrase) :].strip()
 
     async def run(self):
+        self.drive.connect()
         state = State.IDLE
         wake_time = 0.0
         last_text_time = 0.0
@@ -468,6 +576,7 @@ class VoicePickupAgent:
                 await audio_and_logic()
             finally:
                 recv_task.cancel()
+                self.drive.close()
 
     async def handle_command(self, command_text: str):
         if not command_text:
@@ -717,17 +826,45 @@ class VoicePickupAgent:
 
         return False
 
-    # -----------------------------
-    # MOVEMENT COMMAND PLACEHOLDERS
-    # -----------------------------
     def _cmd_turn_toward_heading(self, heading_error_deg: float):
-        """Boilerplate placeholder for robot turn command."""
-        print(f"[MOVE TODO] turn by {heading_error_deg:.1f} deg")
+        """Send turn command as l/r followed by 1..1000 units."""
+        now = time.time()
+        if (now - self._last_drive_cmd_ts) < self.cfg.drive_command_cooldown_sec:
+            return
+
+        angle = int(round(self._normalize_angle(heading_error_deg)))
+        if abs(angle) < int(max(self.cfg.drive_turn_min_abs_deg, 10.0)):
+            return
+
+        angle = max(-180, min(180, angle))
+        units = int(round(abs(angle) * max(self.cfg.drive_turn_units_per_deg, 0.1)))
+        units = max(1, min(1000, units))
+
+        direction = "l" if angle > 0 else "r"
+        command = f"{direction}{units}"
+
+        sent = self.drive.send_command(command)
+        print(f"[DRIVE] turn cmd {command} (angle={angle} deg) {'(serial)' if sent else '(no serial)'}")
+        self._last_drive_cmd_ts = now
 
     def _cmd_drive_forward(self, distance_to_waypoint: float, mode: str):
-        """Boilerplate placeholder for robot forward command."""
-        unit = "cm" if mode == "cm" else "grid"
-        print(f"[MOVE TODO] drive forward toward waypoint ({distance_to_waypoint:.2f} {unit})")
+        """Convert waypoint distance to d<ticks>, where each tick is 100 ms forward."""
+        now = time.time()
+        if (now - self._last_drive_cmd_ts) < self.cfg.drive_command_cooldown_sec:
+            return
+
+        distance_cm = float(distance_to_waypoint) if mode == "cm" else float(distance_to_waypoint) * 100.0
+        if distance_cm <= 0.0:
+            return
+
+        step = max(self.cfg.drive_forward_step_cm, 1.0)
+        ticks = int(np.ceil(distance_cm / step))
+        ticks = max(1, ticks)
+        command = f"d{ticks}"
+
+        sent = self.drive.send_command(command)
+        print(f"[DRIVE] forward cmd {command} for {distance_cm:.1f}cm {'(serial)' if sent else '(no serial)'}")
+        self._last_drive_cmd_ts = now
 
     @staticmethod
     def _normalize_angle(angle_deg: float) -> float:
