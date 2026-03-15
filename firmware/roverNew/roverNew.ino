@@ -19,12 +19,12 @@
 
 const int IN1 = 4;
 const int IN2 = 5;
-const int IN3 = 6;
-const int IN4 = 7;
+const int IN4 = 6;
+const int IN3 = 7;
 const int ENA = 9;
 const int ENB = 10;
 
-const int SPEED = 40;
+const int SPEED = 200;
 
 void setup() {
   Serial.begin(9600);
@@ -90,7 +90,7 @@ void loop() {
     if (input.length() == 0) return;
 
     char cmd = input.charAt(0);
-    int ms = input.substring(1).toInt();
+    int ms = input.substring(1).toInt()*100;
 
     if (cmd == 's') {
       stopMotors();
