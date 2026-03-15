@@ -7,6 +7,10 @@
       "token": "${OPENCLAW_TOKEN}"
     }
   },
+  "stt": {
+    "whisper_server": "ws://YOUR_MAC_IP:8765",
+    "model_dir": "tiny.en"
+  },
   "voice": {
     "talk_mode": {
       "enabled": false

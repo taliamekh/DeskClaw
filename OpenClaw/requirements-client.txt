@@ -1,0 +1,6 @@
+python-dotenv
+sounddevice
+numpy
+websockets
+requests
+cryptography
