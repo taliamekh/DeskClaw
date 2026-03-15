@@ -6,7 +6,7 @@ Run this and use a multimeter on the pins to verify voltage.
 import RPi.GPIO as GPIO
 import time
 
-PINS = {"ENA": 17, "IN1": 22, "IN2": 27, "IN3": 23, "IN4": 24, "ENB": 25}
+PINS = {"ENA": 13, "IN1": 22, "IN2": 27, "IN3": 23, "IN4": 24, "ENB": 12}
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)

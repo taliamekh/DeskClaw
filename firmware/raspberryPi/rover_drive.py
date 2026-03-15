@@ -4,24 +4,24 @@ Controls rover motors via L298N H-bridge on Raspberry Pi GPIO.
 No pathfinding — only exposes movement primitives to be called externally.
 
 Pin mapping:
-  ENA - Pin 17 (PWM speed, left motor)
+  ENA - Pin 13 (left motor enable)
   IN1 - Pin 22
   IN2 - Pin 27
   IN3 - Pin 23
   IN4 - Pin 24
-  ENB - Pin 25 (PWM speed, right motor)
+  ENB - Pin 12 (right motor enable)
 """
 
 import RPi.GPIO as GPIO
 import time
 
 # Pin definitions
-ENA = 17
+ENA = 13
 IN1 = 22
 IN2 = 27
 IN3 = 23
 IN4 = 24
-ENB = 25
+ENB = 12
 
 # Default speed (0-100)
 DEFAULT_SPEED = 60
@@ -41,20 +41,15 @@ class RoverDrive:
         for pin in [ENA, IN1, IN2, IN3, IN4, ENB]:
             GPIO.setup(pin, GPIO.OUT)
             GPIO.output(pin, GPIO.LOW)
-
-        self._pwm_a = GPIO.PWM(ENA, PWM_FREQ)
-        self._pwm_b = GPIO.PWM(ENB, PWM_FREQ)
-        self._pwm_a.start(0)
-        self._pwm_b.start(0)
+        # Enable both motors with direct HIGH (PWM not needed)
+        GPIO.output(ENA, GPIO.HIGH)
+        GPIO.output(ENB, GPIO.HIGH)
 
     def _set_motors(self, left_fwd, left_bwd, right_fwd, right_bwd, speed=None):
-        spd = speed if speed is not None else self.speed
         GPIO.output(IN1, GPIO.HIGH if left_fwd else GPIO.LOW)
         GPIO.output(IN2, GPIO.HIGH if left_bwd else GPIO.LOW)
         GPIO.output(IN3, GPIO.HIGH if right_fwd else GPIO.LOW)
         GPIO.output(IN4, GPIO.HIGH if right_bwd else GPIO.LOW)
-        self._pwm_a.ChangeDutyCycle(spd)
-        self._pwm_b.ChangeDutyCycle(spd)
 
     # --- Movement primitives ---
 
@@ -87,44 +82,37 @@ class RoverDrive:
             self.stop()
 
     def arc_left(self, duration=None, speed=None):
-        """Gentle left arc (right motor faster than left)."""
-        spd = speed if speed is not None else self.speed
-        GPIO.output(IN1, GPIO.HIGH)
+        """Gentle left arc (right motor only)."""
+        GPIO.output(IN1, GPIO.LOW)
         GPIO.output(IN2, GPIO.LOW)
         GPIO.output(IN3, GPIO.HIGH)
         GPIO.output(IN4, GPIO.LOW)
-        self._pwm_a.ChangeDutyCycle(max(spd - 30, 10))  # Left slower
-        self._pwm_b.ChangeDutyCycle(spd)                 # Right full
         if duration:
             time.sleep(duration)
             self.stop()
 
     def arc_right(self, duration=None, speed=None):
-        """Gentle right arc (left motor faster than right)."""
-        spd = speed if speed is not None else self.speed
+        """Gentle right arc (left motor only)."""
         GPIO.output(IN1, GPIO.HIGH)
         GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN3, GPIO.LOW)
         GPIO.output(IN4, GPIO.LOW)
-        self._pwm_a.ChangeDutyCycle(spd)                 # Left full
-        self._pwm_b.ChangeDutyCycle(max(spd - 30, 10))  # Right slower
         if duration:
             time.sleep(duration)
             self.stop()
 
     def stop(self):
         """Stop all motors."""
-        self._set_motors(False, False, False, False, 0)
+        for pin in [IN1, IN2, IN3, IN4]:
+            GPIO.output(pin, GPIO.LOW)
 
     def set_speed(self, speed):
-        """Set default speed (0-100)."""
-        self.speed = max(0, min(100, speed))
+        """No-op — speed control removed (direct GPIO mode)."""
+        pass
 
     def cleanup(self):
         """Release GPIO resources."""
         self.stop()
-        self._pwm_a.stop()
-        self._pwm_b.stop()
         GPIO.cleanup()
 
     def __enter__(self):
