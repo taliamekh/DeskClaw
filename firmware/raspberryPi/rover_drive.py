@@ -1,127 +1,81 @@
 """
 OpenClaw Rover Drive Module
-Controls rover motors via L298N H-bridge on Raspberry Pi GPIO.
-No pathfinding — only exposes movement primitives to be called externally.
+Controls rover motors via Arduino over USB serial (UART 9600).
 
-Pin mapping (ENA/ENB jumpered on L298N):
-  IN1 - GPIO 27 (left motor)
-  IN2 - GPIO 17 (left motor)
-  IN3 - GPIO 23 (right motor)
-  IN4 - GPIO 24 (right motor)
-
-Direction note (based on observed hardware behavior):
-  _set_motors maps: IN1=left_fwd, IN2=left_bwd, IN3=right_fwd, IN4=right_bwd
-  But the actual motor wiring is reversed, so movement methods
-  swap True/False to match real-world directions.
+Protocol: "<cmd><ms>\\n"
+  d<ms> = drive forward for <ms> milliseconds
+  b<ms> = drive backward for <ms> milliseconds
+  l<ms> = turn left for <ms> milliseconds
+  r<ms> = turn right for <ms> milliseconds
+  s     = stop immediately
 """
 
-import RPi.GPIO as GPIO
+import serial
 import time
-
-# Pin definitions — CONFIRMED CORRECT, do not change
-IN1 = 27
-IN2 = 17
-IN3 = 23
-IN4 = 24
-
-DEFAULT_SPEED = 60
+import glob
 
 
-def _force_pins_low():
-    """Use lgpio directly to force all motor pins LOW.
-    Works around rpi-lgpio cleanup bug where pins stay stuck HIGH."""
-    try:
-        import lgpio
-        h = lgpio.gpiochip_open(0)
-        for pin in [IN1, IN2, IN3, IN4]:
-            lgpio.gpio_claim_output(h, pin, 0)
-            lgpio.gpio_write(h, pin, 0)
-        lgpio.gpiochip_close(h)
-    except Exception:
-        pass  # Fall through to normal GPIO setup
+def _find_arduino(preferred="/dev/uno_drive"):
+    """Auto-detect Arduino serial port."""
+    for port in [preferred] + glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"):
+        try:
+            s = serial.Serial(port, 9600, timeout=1)
+            s.close()
+            return port
+        except (serial.SerialException, OSError):
+            continue
+    return None
 
 
 class RoverDrive:
-    def __init__(self, speed=DEFAULT_SPEED):
-        self.speed = speed
-        self._setup()
+    def __init__(self, port=None):
+        self.port = port or _find_arduino()
+        if not self.port:
+            raise RuntimeError("No Arduino found. Check USB connection.")
+        self.ser = serial.Serial(self.port, 9600, timeout=2)
+        time.sleep(2)  # wait for Arduino reset
+        self.ser.read(self.ser.in_waiting or 1)
 
-    def _setup(self):
-        _force_pins_low()
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        for pin in [IN1, IN2, IN3, IN4]:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, GPIO.LOW)
-
-    def _set_motors(self, left_fwd, left_bwd, right_fwd, right_bwd, speed=None):
-        GPIO.output(IN1, GPIO.HIGH if left_fwd else GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH if left_bwd else GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH if right_fwd else GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH if right_bwd else GPIO.LOW)
+    def send(self, cmd):
+        """Send command string, return Arduino response."""
+        self.ser.write(f"{cmd}\n".encode())
+        # Wait for OK:DONE (motor runs on Arduino side)
+        responses = []
+        while True:
+            line = self.ser.readline().decode().strip()
+            if not line:
+                break
+            responses.append(line)
+            if line == "OK:DONE" or line.startswith("ERR"):
+                break
+        return responses
 
     # --- Movement primitives ---
 
-    def forward(self, duration=None, speed=None):
-        """Move forward. If duration given, stops after that many seconds."""
-        self._set_motors(False, True, False, True, speed)
-        if duration:
-            time.sleep(duration)
-            self.stop()
+    def forward(self, ms=1000):
+        """Drive forward for ms milliseconds."""
+        return self.send(f"d{ms}")
 
-    def backward(self, duration=None, speed=None):
-        """Move backward."""
-        self._set_motors(True, False, True, False, speed)
-        if duration:
-            time.sleep(duration)
-            self.stop()
+    def backward(self, ms=1000):
+        """Drive backward for ms milliseconds."""
+        return self.send(f"b{ms}")
 
-    def turn_left(self, duration=None, speed=None):
-        """Turn left in place (right motor forward, left motor back)."""
-        self._set_motors(True, False, False, True, speed)
-        if duration:
-            time.sleep(duration)
-            self.stop()
+    def turn_left(self, ms=500):
+        """Turn left for ms milliseconds."""
+        return self.send(f"l{ms}")
 
-    def turn_right(self, duration=None, speed=None):
-        """Turn right in place (left motor forward, right motor back)."""
-        self._set_motors(False, True, True, False, speed)
-        if duration:
-            time.sleep(duration)
-            self.stop()
-
-    def arc_left(self, duration=None, speed=None):
-        """Gentle left arc (right motor only)."""
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH)
-        if duration:
-            time.sleep(duration)
-            self.stop()
-
-    def arc_right(self, duration=None, speed=None):
-        """Gentle right arc (left motor only)."""
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH)
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.LOW)
-        if duration:
-            time.sleep(duration)
-            self.stop()
+    def turn_right(self, ms=500):
+        """Turn right for ms milliseconds."""
+        return self.send(f"r{ms}")
 
     def stop(self):
-        """Stop all motors."""
-        for pin in [IN1, IN2, IN3, IN4]:
-            GPIO.output(pin, GPIO.LOW)
-
-    def set_speed(self, speed):
-        pass
+        """Stop immediately."""
+        self.ser.write(b"s\n")
+        return self.ser.readline().decode().strip()
 
     def cleanup(self):
         self.stop()
-        _force_pins_low()
-        GPIO.cleanup()
+        self.ser.close()
 
     def __enter__(self):
         return self
