@@ -9,6 +9,20 @@ This is a lightweight standalone loop (not OpenClaw gateway) that runs on Raspbe
 5. Requests path planning from vision API (`POST /plan`).
 6. Polls robot/path state until arrival.
 7. Runs pickup flow (`pickup_controller`) or dry-run stub.
+8. If user asked to "bring it back", follows reverse path after pickup.
+
+## Where the movement loop is
+
+In `basic_agent_loop.py`:
+
+- `VoicePickupAgent.follow_planned_path(...)`
+  - This is the integrated waypoint-following loop.
+  - It reads `/path` + `/robot`, advances waypoint index, and decides turn/forward steps.
+- `VoicePickupAgent._cmd_turn_toward_heading(...)`
+- `VoicePickupAgent._cmd_drive_forward(...)`
+
+Those two methods are intentionally boilerplate placeholders right now.
+Put your real motor/servo drive calls there.
 
 ## Files
 
@@ -54,5 +68,14 @@ python -m unittest tests.test_basic_agent_loop -v
 - `GET /path`
 - `POST /plan` with either:
   - `{"target_name": "bottle"}`
+  - `{"goal_type": "corner", "corner": "top_left", "target_name": "top_left"}`
+  - `{"goal_type": "point", "mode": "cm", "target_name": "point_target", "target_point": {"x": 20, "y": -10}}`
   - `{"clear": true}`
+
+## Example voice commands
+
+- "hey claw pick up the bottle"
+- "hey claw pick up the bottle and bring it back"
+- "hey claw move to top left corner"
+- "hey claw move to x 20 y -10"
 

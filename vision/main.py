@@ -36,6 +36,7 @@ API_PORT = int(os.getenv("VISION_API_PORT", "8787"))
 def default_path_state():
     return {
         "active": False,
+        "goal_type": "",
         "target_name": "",
         "mode": "",
         "waypoints": [],
@@ -161,13 +162,58 @@ class VisionApiHandler(BaseHTTPRequestHandler):
             _json_reply(self, {"ok": True, "queued": "clear path"})
             return
 
+        if isinstance(payload.get("target_point"), dict):
+            point = payload.get("target_point") or {}
+            try:
+                x_val = float(point.get("x"))
+                y_val = float(point.get("y"))
+            except (TypeError, ValueError):
+                _json_reply(self, {"error": "invalid_target_point"}, status=400)
+                return
+
+            mode = str(payload.get("mode", "cm")).lower()
+            if mode not in {"cm", "grid"}:
+                _json_reply(self, {"error": "invalid_mode"}, status=400)
+                return
+
+            label = str(payload.get("target_name", "point_target")).strip() or "point_target"
+            queued = {
+                "goal_type": "point",
+                "target_point": {"x": x_val, "y": y_val},
+                "mode": mode,
+                "target_name": label,
+            }
+            command_queue.put(queued)
+            _json_reply(self, {"ok": True, "queued": queued})
+            return
+
+        corner = payload.get("corner")
+        if corner is not None:
+            corner_name = str(corner).strip().lower().replace(" ", "_")
+            if corner_name not in {"top_left", "top_right", "bottom_right", "bottom_left"}:
+                _json_reply(self, {"error": "invalid_corner"}, status=400)
+                return
+
+            queued = {
+                "goal_type": "corner",
+                "corner": corner_name,
+                "target_name": corner_name,
+            }
+            command_queue.put(queued)
+            _json_reply(self, {"ok": True, "queued": queued})
+            return
+
         target = str(payload.get("target_name", "")).strip()
         if not target:
             _json_reply(self, {"error": "target_name_required"}, status=400)
             return
 
-        command_queue.put(target)
-        _json_reply(self, {"ok": True, "queued": target})
+        queued = {
+            "goal_type": "label",
+            "target_name": target,
+        }
+        command_queue.put(queued)
+        _json_reply(self, {"ok": True, "queued": queued})
 
     def log_message(self, format, *args):
         # Keep the vision console focused on planning/debug prints.
@@ -203,6 +249,7 @@ def update_api_state(detections, robot, path_state, grid_state):
 
     path_payload = {
         "active": bool(path_state.get("active", False)),
+        "goal_type": str(path_state.get("goal_type", "")),
         "target_name": str(path_state.get("target_name", "")),
         "mode": str(path_state.get("mode", "")),
         "status": str(path_state.get("status", "")),
@@ -413,6 +460,20 @@ def get_planning_bounds(grid_state, coord_homography):
     return min_x, min_y, max_x, max_y
 
 
+def get_corner_target_point(corner_name, bounds):
+    if bounds is None:
+        return None
+
+    min_x, min_y, max_x, max_y = bounds
+    corners = {
+        "top_left": (min_x, min_y),
+        "top_right": (max_x, min_y),
+        "bottom_right": (max_x, max_y),
+        "bottom_left": (min_x, max_y),
+    }
+    return corners.get(corner_name)
+
+
 def get_robot_point_for_mode(robot, mode):
     if robot is None:
         return None
@@ -613,7 +674,7 @@ gemini_thread = None
 current_detections = []
 current_crop_payloads = []
 path_state = load_path_state()
-requested_target_name = ""
+requested_plan = None
 
 command_thread = threading.Thread(target=command_input_worker, args=(command_queue,), daemon=True)
 command_thread.start()
@@ -623,21 +684,38 @@ print("OpenClaw Vision System Started")
 print("Press 'w' to get Gemini analysis (make sure camera window is focused)")
 print("Type an object name in terminal (example: bottle) to plan a waypoint path")
 print("Type 'clear path' to remove current-session path")
-print(f"API endpoints: http://{API_HOST}:{API_PORT}/objects  /robot  /path")
+print(f"API endpoints: http://{API_HOST}:{API_PORT}/objects  /robot  /path  POST /plan")
 print("Press 'q' to quit")
 print("=" * 50)
 
 while True:
     while not command_queue.empty():
-        cmd = command_queue.get().strip().lower()
-        if cmd in {"clear", "clear path", "reset path"}:
-            path_state = default_path_state()
-            requested_target_name = ""
-            print("Cleared current-session path.")
-        else:
-            requested_target_name = cmd
-            path_state["status"] = f"Planning path to '{cmd}' when grid is ready"
-            print(f"Queued target request: {cmd}")
+        cmd = command_queue.get()
+
+        if isinstance(cmd, str):
+            cmd_str = cmd.strip().lower()
+            if cmd_str in {"clear", "clear path", "reset path"}:
+                path_state = default_path_state()
+                requested_plan = None
+                print("Cleared current-session path.")
+                continue
+
+            requested_plan = {
+                "goal_type": "label",
+                "target_name": cmd_str,
+            }
+            path_state["status"] = f"Planning path to '{cmd_str}' when grid is ready"
+            print(f"Queued target request: {cmd_str}")
+            continue
+
+        if isinstance(cmd, dict):
+            goal_type = str(cmd.get("goal_type", "")).lower()
+            if goal_type in {"label", "point", "corner"}:
+                requested_plan = cmd
+                target_desc = cmd.get("target_name") or cmd.get("corner") or "point"
+                path_state["status"] = f"Planning path to '{target_desc}' when grid is ready"
+                print(f"Queued target request: {cmd}")
+                continue
 
     ret, frame = cap.read()
     if not ret:
@@ -659,76 +737,98 @@ while True:
         detections = suppress_overlapping_detections(detections)
 
         mode, coord_homography = get_planning_mode_and_homography(grid_state)
-        if requested_target_name and mode and coord_homography is not None:
-            target_detection = select_target_detection(detections, requested_target_name)
-            if target_detection is not None:
-                robot_point = get_robot_point_for_mode(robot, mode)
-                target_point = get_detection_point_for_mode(target_detection, mode)
-                bounds = get_planning_bounds(grid_state, coord_homography)
+        if requested_plan and mode and coord_homography is not None:
+            goal_type = str(requested_plan.get("goal_type", "label")).lower()
+            requested_name = str(requested_plan.get("target_name", "target")).strip() or "target"
 
-                if robot_point and target_point and bounds:
-                    obstacles = build_obstacles(detections, target_detection, mode, coord_homography)
-                    resolution = 3.0 if mode == "cm" else 0.04
+            target_detection = None
+            target_point = None
+            bounds = get_planning_bounds(grid_state, coord_homography)
 
-                    # Plan from slightly ahead of robot and stop before target object's box.
-                    start_offset = ROBOT_START_STANDOFF_CM if mode == "cm" else 0.10
+            if goal_type == "label":
+                target_detection = select_target_detection(detections, requested_name)
+                if target_detection is not None:
+                    target_point = get_detection_point_for_mode(target_detection, mode)
+                else:
+                    path_state["status"] = f"Target '{requested_name}' not visible in grid"
+
+            elif goal_type == "point":
+                request_mode = str(requested_plan.get("mode", mode)).lower()
+                point = requested_plan.get("target_point") or {}
+                if request_mode != mode:
+                    path_state["status"] = (
+                        f"Requested point mode '{request_mode}' not available now (active mode '{mode}')"
+                    )
+                else:
+                    try:
+                        target_point = (float(point.get("x")), float(point.get("y")))
+                    except (TypeError, ValueError):
+                        path_state["status"] = "Invalid target point payload"
+
+            elif goal_type == "corner":
+                corner_name = str(requested_plan.get("corner", "")).lower()
+                target_point = get_corner_target_point(corner_name, bounds)
+                if target_point is None:
+                    path_state["status"] = f"Invalid corner target '{corner_name}'"
+
+            robot_point = get_robot_point_for_mode(robot, mode)
+            if robot_point and target_point and bounds:
+                obstacles = build_obstacles(detections, target_detection, mode, coord_homography)
+                resolution = 3.0 if mode == "cm" else 0.04
+
+                # Plan from slightly ahead of robot and stop before target/object goal.
+                start_offset = ROBOT_START_STANDOFF_CM if mode == "cm" else 0.10
+                if target_detection is not None:
                     target_stop_offset = detection_radius_in_mode(target_detection, mode, coord_homography)
                     target_stop_offset += TARGET_STANDOFF_CM if mode == "cm" else 0.10
-                    planning_start, planning_goal = adjust_endpoints_for_standoff(
-                        robot_point,
-                        target_point,
-                        bounds,
-                        start_offset=start_offset,
-                        goal_offset=target_stop_offset,
-                    )
-
-                    raw_waypoints = plan_path_astar(
-                        planning_start,
-                        planning_goal,
-                        obstacles,
-                        bounds,
-                        resolution=resolution,
-                    )
-                    min_spacing = WAYPOINT_MIN_SPACING_CM if mode == "cm" else 0.08
-                    waypoints = simplify_waypoints(raw_waypoints, min_spacing=min_spacing)
-
-                    if waypoints:
-                        waypoint_headings = compute_waypoint_headings(
-                            waypoints,
-                            fallback_heading=float(robot.get("heading_deg", 0.0)) if robot else 0.0,
-                        )
-
-                        # Force final pose to face the true target center, not just the previous segment.
-                        if waypoint_headings and target_point is not None:
-                            end_x, end_y = waypoints[-1]
-                            to_target_x = float(target_point[0]) - float(end_x)
-                            to_target_y = float(target_point[1]) - float(end_y)
-                            if abs(to_target_x) > 1e-6 or abs(to_target_y) > 1e-6:
-                                waypoint_headings[-1] = float(
-                                    np.degrees(np.arctan2(to_target_y, to_target_x))
-                                )
-
-                        path_state = {
-                            "active": True,
-                            "target_name": requested_target_name,
-                            "mode": mode,
-                            "waypoints": [[float(x), float(y)] for x, y in waypoints],
-                            "waypoint_headings": [float(h) for h in waypoint_headings],
-                            "status": (
-                                f"Path ready to {target_detection.get('label', requested_target_name)} "
-                                f"({len(waypoints)} waypoints)"
-                            ),
-                        }
-                        print(path_state["status"])
-                        requested_target_name = ""
-                    else:
-                        path_state["status"] = (
-                            f"Could not find collision-free path to '{requested_target_name}'"
-                        )
                 else:
-                    path_state["status"] = "Need robot pose and target coordinates to plan"
-            else:
-                path_state["status"] = f"Target '{requested_target_name}' not visible in grid"
+                    target_stop_offset = TARGET_STANDOFF_CM if mode == "cm" else 0.10
+
+                planning_start, planning_goal = adjust_endpoints_for_standoff(
+                    robot_point,
+                    target_point,
+                    bounds,
+                    start_offset=start_offset,
+                    goal_offset=target_stop_offset,
+                )
+
+                raw_waypoints = plan_path_astar(
+                    planning_start,
+                    planning_goal,
+                    obstacles,
+                    bounds,
+                    resolution=resolution,
+                )
+                min_spacing = WAYPOINT_MIN_SPACING_CM if mode == "cm" else 0.08
+                waypoints = simplify_waypoints(raw_waypoints, min_spacing=min_spacing)
+
+                if waypoints:
+                    waypoint_headings = compute_waypoint_headings(
+                        waypoints,
+                        fallback_heading=float(robot.get("heading_deg", 0.0)) if robot else 0.0,
+                    )
+
+                    end_x, end_y = waypoints[-1]
+                    to_target_x = float(target_point[0]) - float(end_x)
+                    to_target_y = float(target_point[1]) - float(end_y)
+                    if abs(to_target_x) > 1e-6 or abs(to_target_y) > 1e-6:
+                        waypoint_headings[-1] = float(np.degrees(np.arctan2(to_target_y, to_target_x)))
+
+                    path_state = {
+                        "active": True,
+                        "goal_type": goal_type,
+                        "target_name": requested_name,
+                        "mode": mode,
+                        "waypoints": [[float(x), float(y)] for x, y in waypoints],
+                        "waypoint_headings": [float(h) for h in waypoint_headings],
+                        "status": f"Path ready to {requested_name} ({len(waypoints)} waypoints)",
+                    }
+                    print(path_state["status"])
+                    requested_plan = None
+                else:
+                    path_state["status"] = f"Could not find collision-free path to '{requested_name}'"
+            elif requested_plan and "Target" not in path_state.get("status", ""):
+                path_state["status"] = "Need robot pose and target coordinates to plan"
     else:
         detections = []
         if path_state.get("active"):

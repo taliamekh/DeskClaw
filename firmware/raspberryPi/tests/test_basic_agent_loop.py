@@ -1,10 +1,16 @@
 import unittest
-import sys
+import importlib.util
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+MODULE_PATH = Path(__file__).resolve().parents[1] / "basic_agent_loop.py"
+SPEC = importlib.util.spec_from_file_location("basic_agent_loop", MODULE_PATH)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC is not None and SPEC.loader is not None
+SPEC.loader.exec_module(MODULE)
 
-from basic_agent_loop import LabelResolver, AgentConfig, parse_intent
+LabelResolver = MODULE.LabelResolver
+AgentConfig = MODULE.AgentConfig
+parse_intent = MODULE.parse_intent
 
 
 class BasicAgentLoopTests(unittest.TestCase):
@@ -30,6 +36,16 @@ class BasicAgentLoopTests(unittest.TestCase):
         labels = ["bottle", "cup", "book"]
         chosen = self.resolver._fallback_match("can you find my bottle", labels)
         self.assertEqual(chosen, "bottle")
+
+    def test_parse_move_corner_intent(self):
+        intent = parse_intent("move to the top left corner")
+        self.assertEqual(intent["action"], "move")
+        self.assertEqual(intent["corner"], "top_left")
+
+    def test_parse_pickup_bring_back_intent(self):
+        intent = parse_intent("pick up the bottle and bring it back")
+        self.assertEqual(intent["action"], "pickup")
+        self.assertTrue(intent["bring_back"])
 
 
 if __name__ == "__main__":
