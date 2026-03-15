@@ -2,36 +2,26 @@
   "version": "1.0",
   "gateway": {
     "host": "127.0.0.1",
-    "port": 18789
+    "port": 18789,
+    "auth": {
+      "token": "${OPENCLAW_TOKEN}"
+    }
   },
   "voice": {
     "talk_mode": {
-      "enabled": true,
-      "auto_detect_silence": true,
-      "silence_threshold_ms": 1500,
-      "language": "en",
-      "continuous": true
+      "enabled": false
     },
     "wake": {
-      "enabled": true,
-      "wake_word": "hey claw",
-      "sensitivity": 0.5,
-      "cooldown_seconds": 2
+      "enabled": false,
+      "wake_word": "hey claw"
     }
-  },
-  "stt": {
-    "provider": "whisper",
-    "api_key": "${OPENAI_API_KEY}",
-    "model": "whisper-1",
-    "language": "en",
-    "temperature": 0
   },
   "tts": {
     "provider": "elevenlabs",
     "api_key": "${ELEVENLABS_API_KEY}",
-    "voice_id": "21m00Tcm4TlvDq8ikWAM",
-    "model": "eleven_monolingual_v1",
-    "auto_speak": "talk_mode_only",
+    "voice_id": "nPczCjzI2devNBz1zQrb",
+    "model": "eleven_multilingual_v2",
+    "auto_speak": "never",
     "max_speak_length": 500,
     "speed": 1.0
   },
