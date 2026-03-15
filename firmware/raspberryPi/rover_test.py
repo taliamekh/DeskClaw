@@ -25,6 +25,10 @@ def run():
         print("Failed to open webcam")
         return
 
+    # Warmup — discard first few frames
+    for _ in range(10):
+        cam.grab_frame()
+
     print("=== ROVER WEBCAM TEST ===")
     print(f"Center tolerance: {CENTER_TOL}px")
     print(f"Close enough area: {CLOSE_AREA}px")
@@ -40,7 +44,7 @@ def run():
                 time.sleep(0.3)
                 continue
 
-            dx, area = g["dx"], g["area"]
+            dx, area = int(g["dx"]), int(g["area"])
             print(f"dx={dx:+4d}  area={area:6d}", end="  ")
 
             # Close enough — stop
@@ -66,7 +70,11 @@ def run():
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
-        rover.cleanup()
+        try:
+            rover.stop()
+            rover.cleanup()
+        except Exception:
+            pass
         cam.close()
         print("Test complete.")
 
