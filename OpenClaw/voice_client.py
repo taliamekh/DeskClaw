@@ -26,7 +26,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 WHISPER_STREAMING_DIR = SCRIPT_DIR / "whisper_streaming"
 sys.path.insert(0, str(WHISPER_STREAMING_DIR))
 
-from whisper_online import OpenaiApiASR, OnlineASRProcessor
+from whisper_online import FasterWhisperASR, OnlineASRProcessor
 
 load_dotenv(SCRIPT_DIR.parent / ".env")
 
@@ -318,8 +318,8 @@ def main():
     if wake_word.lower() not in WAKE_PHRASES:
         WAKE_PHRASES.append(wake_word.lower())
 
-    logger.info("Initializing OpenAI Whisper API backend...")
-    asr = OpenaiApiASR(lan="en", temperature=0)
+    logger.info("Initializing local Whisper (faster-whisper tiny.en)...")
+    asr = FasterWhisperASR(lan="en", modelsize="tiny.en")
     online = OnlineASRProcessor(asr, buffer_trimming=("segment", 15))
 
     state = State.IDLE

@@ -20,7 +20,7 @@
     "provider": "elevenlabs",
     "api_key": "${ELEVENLABS_API_KEY}",
     "voice_id": "nPczCjzI2devNBz1zQrb",
-    "model": "eleven_multilingual_v2",
+    "model": "eleven_flash_v2_5",
     "auto_speak": "never",
     "max_speak_length": 500,
     "speed": 1.0
@@ -28,7 +28,7 @@
   "models": {
     "primary": {
       "provider": "google",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key": "${GEMINI_API_KEY}"
     }
   },

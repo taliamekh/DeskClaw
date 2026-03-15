@@ -5,3 +5,4 @@ openai
 websockets
 requests
 cryptography
+faster-whisper
