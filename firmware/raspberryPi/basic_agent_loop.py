@@ -41,6 +41,8 @@ class AgentConfig:
     wake_timeout: float = 10.0
     poll_interval: float = 0.35
     arrival_threshold_cm: float = 12.0
+    waypoint_tolerance_cm: float = 8.0
+    heading_tolerance_deg: float = 12.0
     path_timeout_sec: float = 90.0
     llm_api_url: str = "https://api.openai.com/v1/chat/completions"
     llm_model: str = "gpt-4o-mini"
@@ -64,6 +66,8 @@ def load_config(path: str) -> AgentConfig:
         wake_timeout=float(raw.get("timing", {}).get("wake_timeout", 10.0)),
         poll_interval=float(raw.get("timing", {}).get("poll_interval", 0.35)),
         arrival_threshold_cm=float(raw.get("nav", {}).get("arrival_threshold_cm", 12.0)),
+        waypoint_tolerance_cm=float(raw.get("nav", {}).get("waypoint_tolerance_cm", 8.0)),
+        heading_tolerance_deg=float(raw.get("nav", {}).get("heading_tolerance_deg", 12.0)),
         path_timeout_sec=float(raw.get("nav", {}).get("path_timeout_sec", 90.0)),
         llm_api_url=raw.get("llm", {}).get("api_url", "https://api.openai.com/v1/chat/completions"),
         llm_model=raw.get("llm", {}).get("model", "gpt-4o-mini"),
@@ -102,6 +106,15 @@ class VisionApiClient:
         response.raise_for_status()
         return response.json()
 
+    def queue_plan_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/plan",
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def clear_plan(self) -> Dict[str, Any]:
         response = requests.post(
             f"{self.base_url}/plan",
@@ -115,9 +128,12 @@ class VisionApiClient:
 def parse_intent(command_text: str) -> Dict[str, Optional[str]]:
     text = command_text.strip().lower()
     action = None
+    bring_back = any(p in text for p in ["bring it", "bring back", "bring it back", "return with it"])
 
     if any(k in text for k in ["pick up", "pickup", "grab", "get me"]):
         action = "pickup"
+    elif any(k in text for k in ["move to", "go to", "navigate to", "drive to"]):
+        action = "move"
     elif any(k in text for k in ["find", "locate", "where is"]):
         action = "find"
 
@@ -134,9 +150,27 @@ def parse_intent(command_text: str) -> Dict[str, Optional[str]]:
 
     target = re.sub(r"\b(for me|please|right now)\b", "", target).strip()
 
+    corner = None
+    for token in ["top left", "top right", "bottom right", "bottom left"]:
+        if token in text:
+            corner = token.replace(" ", "_")
+            break
+
+    coord_match = re.search(r"(?:x\s*[:=]?\s*(-?\d+(?:\.\d+)?)\D+y\s*[:=]?\s*(-?\d+(?:\.\d+)?))", text)
+    if coord_match:
+        coord = {
+            "x": float(coord_match.group(1)),
+            "y": float(coord_match.group(2)),
+        }
+    else:
+        coord = None
+
     return {
         "action": action,
         "target_description": target if target else None,
+        "bring_back": bring_back,
+        "corner": corner,
+        "coordinate": coord,
         "raw": command_text,
     }
 
@@ -154,6 +188,83 @@ class LabelResolver:
             return llm_choice
 
         return self._fallback_match(user_description, labels)
+
+    def resolve_move_target(self, user_description: str) -> Optional[Dict[str, Any]]:
+        # Fast path for explicit corner words.
+        for token in ["top_left", "top_right", "bottom_right", "bottom_left"]:
+            if token.replace("_", " ") in user_description.lower() or token in user_description.lower():
+                return {"goal_type": "corner", "corner": token, "target_name": token}
+
+        # Fast path for explicit x,y mention.
+        match = re.search(r"x\s*[:=]?\s*(-?\d+(?:\.\d+)?)\D+y\s*[:=]?\s*(-?\d+(?:\.\d+)?)", user_description.lower())
+        if match:
+            return {
+                "goal_type": "point",
+                "mode": "cm",
+                "target_name": "point_target",
+                "target_point": {
+                    "x": float(match.group(1)),
+                    "y": float(match.group(2)),
+                },
+            }
+
+        llm_result = self._resolve_move_with_llm(user_description)
+        if llm_result is not None:
+            return llm_result
+        return None
+
+    def _resolve_move_with_llm(self, user_description: str) -> Optional[Dict[str, Any]]:
+        api_key = os.getenv(self.cfg.llm_api_key_env, "").strip()
+        if not api_key:
+            return None
+
+        system_prompt = (
+            "Extract a navigation goal from the user request. "
+            "Return strict JSON only, either: "
+            '{"goal_type":"corner","corner":"top_left|top_right|bottom_right|bottom_left"} '
+            "or "
+            '{"goal_type":"point","mode":"cm","x":number,"y":number}."
+        )
+        payload = {
+            "model": self.cfg.llm_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"User request: {user_description}"},
+            ],
+            "temperature": 0.0,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = requests.post(self.cfg.llm_api_url, headers=headers, json=payload, timeout=12)
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            parsed = self._extract_json(content)
+            goal_type = str(parsed.get("goal_type", "")).lower()
+            if goal_type == "corner":
+                corner = str(parsed.get("corner", "")).strip().lower()
+                if corner in {"top_left", "top_right", "bottom_right", "bottom_left"}:
+                    return {"goal_type": "corner", "corner": corner, "target_name": corner}
+                return None
+
+            if goal_type == "point":
+                return {
+                    "goal_type": "point",
+                    "mode": "cm",
+                    "target_name": "point_target",
+                    "target_point": {
+                        "x": float(parsed.get("x")),
+                        "y": float(parsed.get("y")),
+                    },
+                }
+        except Exception:
+            return None
+
+        return None
 
     def _resolve_with_llm(self, user_description: str, labels: List[str]) -> Optional[str]:
         api_key = os.getenv(self.cfg.llm_api_key_env, "").strip()
@@ -364,51 +475,107 @@ class VoicePickupAgent:
 
         print(f"You said: {command_text}")
         intent = parse_intent(command_text)
+        action = intent.get("action") or "pickup"
         target_description = intent.get("target_description")
-        if not target_description:
-            print("Could not parse a target description from command.")
-            return
+        bring_back = bool(intent.get("bring_back"))
 
-        try:
-            objects_data = self.vision.get_objects()
-        except Exception as exc:
-            print(f"Vision API unavailable: {exc}")
-            return
+        plan_request = None
+        selected_label = None
 
-        labels = objects_data.get("labels", [])
-        if not labels:
-            print("No visible labels from vision right now.")
-            return
+        if action == "move":
+            if intent.get("coordinate") is not None:
+                point = intent["coordinate"]
+                plan_request = {
+                    "goal_type": "point",
+                    "mode": "cm",
+                    "target_name": "point_target",
+                    "target_point": {"x": float(point["x"]), "y": float(point["y"])},
+                }
+            elif intent.get("corner"):
+                corner = str(intent["corner"])
+                plan_request = {
+                    "goal_type": "corner",
+                    "corner": corner,
+                    "target_name": corner,
+                }
+            elif target_description:
+                plan_request = self.resolver.resolve_move_target(str(target_description))
 
-        target_label = self.resolver.resolve(str(target_description), labels)
-        if not target_label:
-            print("No matching label found for intent.")
-            return
+            if plan_request is None:
+                print("Could not resolve move target. Try 'move to x 20 y -10' or 'move to top left corner'.")
+                return
 
-        print(f"Selected label: {target_label}")
-        try:
-            self.vision.queue_plan(target_label)
-        except Exception as exc:
-            print(f"Failed to queue plan: {exc}")
-            return
+            print(f"Selected move target: {plan_request}")
+            try:
+                self.vision.queue_plan_request(plan_request)
+            except Exception as exc:
+                print(f"Failed to queue move plan: {exc}")
+                return
 
-        arrived = await self.wait_for_arrival(target_label)
+        else:
+            if not target_description:
+                print("Could not parse a target description from command.")
+                return
+
+            try:
+                objects_data = self.vision.get_objects()
+            except Exception as exc:
+                print(f"Vision API unavailable: {exc}")
+                return
+
+            labels = objects_data.get("labels", [])
+            if not labels:
+                print("No visible labels from vision right now.")
+                return
+
+            selected_label = self.resolver.resolve(str(target_description), labels)
+            if not selected_label:
+                print("No matching label found for intent.")
+                return
+
+            print(f"Selected label: {selected_label}")
+            try:
+                self.vision.queue_plan(selected_label)
+            except Exception as exc:
+                print(f"Failed to queue plan: {exc}")
+                return
+
+        arrived, path_snapshot = await self.follow_planned_path(selected_label)
         if not arrived:
             print("Did not reach target waypoint before timeout.")
             return
 
+        if action == "move":
+            print("Move command complete.")
+            return
+
         latest_objects = self.vision.get_objects().get("objects", [])
-        target_obj = self._best_object_by_label(latest_objects, target_label)
+        target_obj = self._best_object_by_label(latest_objects, selected_label or "")
         robot = self.vision.get_robot().get("robot")
         if not target_obj:
             print("Target object no longer visible at pickup stage.")
             return
 
-        pickup_result = self.pickup.run(target_label, target_obj, robot or {})
+        pickup_result = self.pickup.run(selected_label or "target", target_obj, robot or {})
         print(f"Pickup result: {pickup_result}")
 
-    async def wait_for_arrival(self, target_label: str) -> bool:
+        if bring_back and pickup_result.get("success") and path_snapshot is not None:
+            print("Bring-back requested: returning along reverse path...")
+            returned = await self.follow_reverse_path(path_snapshot)
+            if not returned:
+                print("Return traversal timed out before completion.")
+
+    # =====================
+    # INTEGRATED MOTION LOOP
+    # =====================
+    # This is where the agent consumes planned waypoints and executes them.
+    # Replace _cmd_turn_toward_heading and _cmd_drive_forward with your actual
+    # rover motor calls (serial, GPIO, CAN, etc.).
+    async def follow_planned_path(self, target_label: Optional[str]) -> Tuple[bool, Optional[Dict[str, Any]]]:
         deadline = time.time() + self.cfg.path_timeout_sec
+        waypoint_index = 0
+        last_path = None
+
         while time.time() < deadline:
             try:
                 path_resp = self.vision.get_path()
@@ -419,21 +586,26 @@ class VoicePickupAgent:
 
             path = path_resp.get("path", {})
             robot = robot_resp.get("robot") or {}
+            last_path = path
 
             if not path.get("active"):
                 await asyncio.sleep(self.cfg.poll_interval)
                 continue
 
             path_target = str(path.get("target_name", ""))
-            if path_target and path_target != target_label:
+            if target_label and path_target and path_target != target_label:
                 await asyncio.sleep(self.cfg.poll_interval)
                 continue
 
             waypoints = path.get("waypoints") or []
+            headings = path.get("waypoint_headings") or []
             mode = path.get("mode", "")
             if not waypoints:
                 await asyncio.sleep(self.cfg.poll_interval)
                 continue
+
+            if waypoint_index >= len(waypoints):
+                waypoint_index = len(waypoints) - 1
 
             end_x, end_y = waypoints[-1]
             robot_point = self._robot_point_for_mode(robot, mode)
@@ -441,17 +613,151 @@ class VoicePickupAgent:
                 await asyncio.sleep(self.cfg.poll_interval)
                 continue
 
+            # Move along path one waypoint at a time.
+            wp_x, wp_y = waypoints[waypoint_index]
+            dist_to_wp = float(np.hypot(wp_x - robot_point[0], wp_y - robot_point[1]))
+            wp_tol = self.cfg.waypoint_tolerance_cm if mode == "cm" else 0.05
+
+            if dist_to_wp <= wp_tol:
+                if waypoint_index < len(waypoints) - 1:
+                    waypoint_index += 1
+                    await asyncio.sleep(self.cfg.poll_interval)
+                    continue
+
+            desired_heading = self._desired_heading_for_waypoint(
+                headings=headings,
+                waypoints=waypoints,
+                waypoint_index=waypoint_index,
+                robot_point=robot_point,
+            )
+            robot_heading = self._robot_heading_deg(robot)
+            heading_error = self._normalize_angle(desired_heading - robot_heading)
+
+            if abs(heading_error) > self.cfg.heading_tolerance_deg:
+                self._cmd_turn_toward_heading(heading_error)
+            else:
+                self._cmd_drive_forward(dist_to_wp, mode)
+
             dist = float(np.hypot(end_x - robot_point[0], end_y - robot_point[1]))
             if mode == "cm" and dist <= self.cfg.arrival_threshold_cm:
                 print(f"Arrival reached (distance {dist:.2f} cm)")
-                return True
+                return True, path
             if mode == "grid" and dist <= 0.08:
                 print(f"Arrival reached (normalized distance {dist:.3f})")
+                return True, path
+
+            await asyncio.sleep(self.cfg.poll_interval)
+
+        return False, last_path
+
+    async def follow_reverse_path(self, path_snapshot: Dict[str, Any]) -> bool:
+        waypoints = path_snapshot.get("waypoints") or []
+        mode = str(path_snapshot.get("mode", "cm"))
+        if not waypoints:
+            return False
+
+        reverse_waypoints = list(reversed(waypoints))
+        reverse_headings = []
+        for i in range(len(reverse_waypoints) - 1):
+            x1, y1 = reverse_waypoints[i]
+            x2, y2 = reverse_waypoints[i + 1]
+            reverse_headings.append(float(np.degrees(np.arctan2(y2 - y1, x2 - x1))))
+        if reverse_headings:
+            reverse_headings.append(reverse_headings[-1])
+        else:
+            reverse_headings.append(0.0)
+
+        deadline = time.time() + self.cfg.path_timeout_sec
+        waypoint_index = 0
+
+        while time.time() < deadline:
+            try:
+                robot_resp = self.vision.get_robot()
+            except Exception:
+                await asyncio.sleep(self.cfg.poll_interval)
+                continue
+
+            robot = robot_resp.get("robot") or {}
+            robot_point = self._robot_point_for_mode(robot, mode)
+            if robot_point is None:
+                await asyncio.sleep(self.cfg.poll_interval)
+                continue
+
+            if waypoint_index >= len(reverse_waypoints):
+                waypoint_index = len(reverse_waypoints) - 1
+
+            wp_x, wp_y = reverse_waypoints[waypoint_index]
+            dist_to_wp = float(np.hypot(wp_x - robot_point[0], wp_y - robot_point[1]))
+            wp_tol = self.cfg.waypoint_tolerance_cm if mode == "cm" else 0.05
+
+            if dist_to_wp <= wp_tol:
+                if waypoint_index < len(reverse_waypoints) - 1:
+                    waypoint_index += 1
+                    await asyncio.sleep(self.cfg.poll_interval)
+                    continue
+
+                print("Return path complete.")
                 return True
+
+            desired_heading = self._desired_heading_for_waypoint(
+                headings=reverse_headings,
+                waypoints=reverse_waypoints,
+                waypoint_index=waypoint_index,
+                robot_point=robot_point,
+            )
+            robot_heading = self._robot_heading_deg(robot)
+            heading_error = self._normalize_angle(desired_heading - robot_heading)
+
+            if abs(heading_error) > self.cfg.heading_tolerance_deg:
+                self._cmd_turn_toward_heading(heading_error)
+            else:
+                self._cmd_drive_forward(dist_to_wp, mode)
 
             await asyncio.sleep(self.cfg.poll_interval)
 
         return False
+
+    # -----------------------------
+    # MOVEMENT COMMAND PLACEHOLDERS
+    # -----------------------------
+    def _cmd_turn_toward_heading(self, heading_error_deg: float):
+        """Boilerplate placeholder for robot turn command."""
+        print(f"[MOVE TODO] turn by {heading_error_deg:.1f} deg")
+
+    def _cmd_drive_forward(self, distance_to_waypoint: float, mode: str):
+        """Boilerplate placeholder for robot forward command."""
+        unit = "cm" if mode == "cm" else "grid"
+        print(f"[MOVE TODO] drive forward toward waypoint ({distance_to_waypoint:.2f} {unit})")
+
+    @staticmethod
+    def _normalize_angle(angle_deg: float) -> float:
+        while angle_deg > 180.0:
+            angle_deg -= 360.0
+        while angle_deg < -180.0:
+            angle_deg += 360.0
+        return angle_deg
+
+    @staticmethod
+    def _robot_heading_deg(robot: Dict[str, Any]) -> float:
+        value = robot.get("heading_deg")
+        if value is None:
+            return 0.0
+        return float(value)
+
+    @staticmethod
+    def _desired_heading_for_waypoint(
+        headings: List[float],
+        waypoints: List[List[float]],
+        waypoint_index: int,
+        robot_point: Tuple[float, float],
+    ) -> float:
+        if waypoint_index < len(headings):
+            return float(headings[waypoint_index])
+
+        wp_x, wp_y = waypoints[waypoint_index]
+        dx = float(wp_x) - float(robot_point[0])
+        dy = float(wp_y) - float(robot_point[1])
+        return float(np.degrees(np.arctan2(dy, dx)))
 
     @staticmethod
     def _robot_point_for_mode(robot: Dict[str, Any], mode: str) -> Optional[Tuple[float, float]]:

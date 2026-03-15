@@ -13,6 +13,8 @@
 - `POST /plan` (also `/api/plan`)
   - Queue or clear path planning requests.
   - Body: `{"target_name": "bottle"}` to plan.
+  - Body: `{"goal_type":"corner","corner":"top_left","target_name":"top_left"}` for corner move.
+  - Body: `{"goal_type":"point","mode":"cm","target_name":"point_target","target_point":{"x":20,"y":-10}}` for coordinate move.
   - Body: `{"clear": true}` to clear.
 
 ## Defaults
