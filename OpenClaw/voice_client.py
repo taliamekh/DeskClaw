@@ -323,12 +323,11 @@ async def main():
         async def audio_and_logic():
             nonlocal state, last_text_time, wake_time
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                                 dtype="float32", blocksize=chunk_samples) as mic:
                 while True:
-                    # Read audio from mic in a thread so we don't block the loop
                     audio_chunk, overflowed = await loop.run_in_executor(
                         None, mic.read, chunk_samples,
                     )
@@ -416,7 +415,7 @@ async def _process_command(command_buffer, config, gw_host, gw_port, whisper_ws)
         logger.info("Response: %s", response[:200])
         print(f"  Claw: {response}")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, stream_speak, response, config)
         except Exception as e:
             logger.error("TTS/playback failed: %s", e)
