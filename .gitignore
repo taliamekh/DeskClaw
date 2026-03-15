@@ -8,3 +8,8 @@ output/
 .kiro/
 uv.lock
 env
+OpenClaw/venv/
+OpenClaw/whisper_streaming/
+OpenClaw/output/
+OpenClaw/device_identity.json
+__pycache__/
