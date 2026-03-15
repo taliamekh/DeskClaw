@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Basic Raspberry Pi voice agent loop for find-and-pick tasks.
+
+Flow:
+1) Listen to mic and stream audio to faster-whisper websocket server.
+2) Wait for wake phrase, then capture command text.
+3) Parse intent and map user description -> current vision label using an LLM.
+4) Request path planning via vision API (/plan), then poll robot/path endpoints.
+5) When arrived near final waypoint, run pickup process (or dry-run stub).
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import requests
+import sounddevice as sd
+import websockets
+
+
+class State(Enum):
+    IDLE = "idle"
+    ACTIVE = "active"
+
+
+@dataclass
+class AgentConfig:
+    whisper_url: str
+    vision_api_base: str
+    wake_phrase: str
+    sample_rate: int = 16000
+    chunk_duration: float = 0.5
+    silence_timeout: float = 2.0
+    wake_timeout: float = 10.0
+    poll_interval: float = 0.35
+    arrival_threshold_cm: float = 12.0
+    path_timeout_sec: float = 90.0
+    llm_api_url: str = "https://api.openai.com/v1/chat/completions"
+    llm_model: str = "gpt-4o-mini"
+    llm_api_key_env: str = "OPENAI_API_KEY"
+    dry_run_pickup: bool = True
+    serial_port: str = "/dev/ttyUSB0"
+    camera_index: int = 0
+
+
+def load_config(path: str) -> AgentConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    return AgentConfig(
+        whisper_url=raw["stt"]["whisper_server"],
+        vision_api_base=raw["vision"]["api_base"].rstrip("/"),
+        wake_phrase=raw.get("wake", {}).get("phrase", "hey claw").lower(),
+        sample_rate=int(raw.get("audio", {}).get("sample_rate", 16000)),
+        chunk_duration=float(raw.get("audio", {}).get("chunk_duration", 0.5)),
+        silence_timeout=float(raw.get("timing", {}).get("silence_timeout", 2.0)),
+        wake_timeout=float(raw.get("timing", {}).get("wake_timeout", 10.0)),
+        poll_interval=float(raw.get("timing", {}).get("poll_interval", 0.35)),
+        arrival_threshold_cm=float(raw.get("nav", {}).get("arrival_threshold_cm", 12.0)),
+        path_timeout_sec=float(raw.get("nav", {}).get("path_timeout_sec", 90.0)),
+        llm_api_url=raw.get("llm", {}).get("api_url", "https://api.openai.com/v1/chat/completions"),
+        llm_model=raw.get("llm", {}).get("model", "gpt-4o-mini"),
+        llm_api_key_env=raw.get("llm", {}).get("api_key_env", "OPENAI_API_KEY"),
+        dry_run_pickup=bool(raw.get("pickup", {}).get("dry_run", True)),
+        serial_port=raw.get("pickup", {}).get("serial_port", "/dev/ttyUSB0"),
+        camera_index=int(raw.get("pickup", {}).get("camera_index", 0)),
+    )
+
+
+class VisionApiClient:
+    def __init__(self, base_url: str, timeout: float = 3.0):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def _get(self, path: str) -> Dict[str, Any]:
+        response = requests.get(f"{self.base_url}{path}", timeout=self.timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def get_objects(self) -> Dict[str, Any]:
+        return self._get("/objects")
+
+    def get_robot(self) -> Dict[str, Any]:
+        return self._get("/robot")
+
+    def get_path(self) -> Dict[str, Any]:
+        return self._get("/path")
+
+    def queue_plan(self, target_name: str) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/plan",
+            json={"target_name": target_name},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def clear_plan(self) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/plan",
+            json={"clear": True},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def parse_intent(command_text: str) -> Dict[str, Optional[str]]:
+    text = command_text.strip().lower()
+    action = None
+
+    if any(k in text for k in ["pick up", "pickup", "grab", "get me"]):
+        action = "pickup"
+    elif any(k in text for k in ["find", "locate", "where is"]):
+        action = "find"
+
+    target = text
+    patterns = [
+        r"(?:pick up|pickup|grab|get me|find|locate|where is)\s+(?:the\s+)?(.+)",
+        r"(?:can you|please)\s+(?:pick up|find|grab)\s+(?:the\s+)?(.+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            target = match.group(1).strip()
+            break
+
+    target = re.sub(r"\b(for me|please|right now)\b", "", target).strip()
+
+    return {
+        "action": action,
+        "target_description": target if target else None,
+        "raw": command_text,
+    }
+
+
+class LabelResolver:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+
+    def resolve(self, user_description: str, labels: List[str]) -> Optional[str]:
+        if not labels:
+            return None
+
+        llm_choice = self._resolve_with_llm(user_description, labels)
+        if llm_choice in labels:
+            return llm_choice
+
+        return self._fallback_match(user_description, labels)
+
+    def _resolve_with_llm(self, user_description: str, labels: List[str]) -> Optional[str]:
+        api_key = os.getenv(self.cfg.llm_api_key_env, "").strip()
+        if not api_key:
+            return None
+
+        system_prompt = (
+            "You map user intent descriptions to one label from live vision detections. "
+            "The user is trying to find/pick an object. Return only strict JSON: "
+            '{"label":"<one label or null>","reason":"short"}. '
+            "label must be exactly one of the provided labels or null."
+        )
+        user_prompt = (
+            f"User request: {user_description}\n"
+            f"Available labels: {labels}\n"
+            "Choose the best matching label."
+        )
+
+        payload = {
+            "model": self.cfg.llm_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = requests.post(self.cfg.llm_api_url, headers=headers, json=payload, timeout=12)
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            parsed = self._extract_json(content)
+            label = parsed.get("label")
+            return label if isinstance(label, str) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_json(text: str) -> Dict[str, Any]:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text.replace("json", "", 1).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return {}
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+
+    @staticmethod
+    def _fallback_match(user_description: str, labels: List[str]) -> Optional[str]:
+        lowered = user_description.lower()
+        for label in labels:
+            if label.lower() in lowered:
+                return label
+
+        target_tokens = set(re.findall(r"[a-z0-9]+", lowered))
+        if not target_tokens:
+            return labels[0]
+
+        best_label = None
+        best_score = -1
+        for label in labels:
+            label_tokens = set(re.findall(r"[a-z0-9]+", label.lower()))
+            score = len(target_tokens & label_tokens)
+            if score > best_score:
+                best_score = score
+                best_label = label
+
+        return best_label or labels[0]
+
+
+class PickupRunner:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+
+    def run(self, label: str, target_obj: Dict[str, Any], robot: Dict[str, Any]) -> Dict[str, Any]:
+        if self.cfg.dry_run_pickup:
+            return {
+                "success": True,
+                "message": f"DRY RUN pickup for {label}",
+                "target": target_obj,
+                "robot": robot,
+            }
+
+        from pickup_controller import pickup
+
+        target_cm = target_obj.get("position_cm") or {}
+        robot_cm = (robot or {}).get("pose_position_cm") or (robot or {}).get("position_cm") or {}
+        heading = float((robot or {}).get("heading_deg") or 0.0)
+
+        return pickup(
+            target_x=float(target_cm.get("x", 0.0)),
+            target_y=float(target_cm.get("y", 0.0)),
+            rover_x=float(robot_cm.get("x", 0.0)),
+            rover_y=float(robot_cm.get("y", 0.0)),
+            heading=heading,
+            serial_port=self.cfg.serial_port,
+            camera_index=self.cfg.camera_index,
+        )
+
+
+class VoicePickupAgent:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        self.vision = VisionApiClient(cfg.vision_api_base)
+        self.resolver = LabelResolver(cfg)
+        self.pickup = PickupRunner(cfg)
+
+    @staticmethod
+    def _contains_wake_phrase(text: str, wake_phrase: str) -> bool:
+        return wake_phrase in text.lower().strip()
+
+    @staticmethod
+    def _strip_wake_phrase(text: str, wake_phrase: str) -> str:
+        lower = text.lower()
+        idx = lower.find(wake_phrase)
+        if idx == -1:
+            return text.strip()
+        return text[idx + len(wake_phrase) :].strip()
+
+    async def run(self):
+        state = State.IDLE
+        wake_time = 0.0
+        last_text_time = 0.0
+        command_buffer: List[str] = []
+
+        chunk_samples = int(self.cfg.sample_rate * self.cfg.chunk_duration)
+        transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+
+        print(f"Listening for wake phrase '{self.cfg.wake_phrase}'...")
+        print(f"Whisper websocket: {self.cfg.whisper_url}")
+        print(f"Vision API: {self.cfg.vision_api_base}")
+
+        async with websockets.connect(self.cfg.whisper_url, ping_interval=20, ping_timeout=60, max_size=2**22) as ws:
+            async def recv_transcripts():
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    if msg.get("type") == "transcript":
+                        await transcript_queue.put(str(msg.get("text", "")))
+
+            async def audio_and_logic():
+                nonlocal state, wake_time, last_text_time
+                loop = asyncio.get_event_loop()
+                with sd.InputStream(
+                    samplerate=self.cfg.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=chunk_samples,
+                ) as mic:
+                    while True:
+                        chunk, overflowed = await loop.run_in_executor(None, mic.read, chunk_samples)
+                        if overflowed:
+                            print("[warn] audio overflow")
+
+                        audio = chunk[:, 0].astype(np.float32)
+                        await ws.send(audio.tobytes())
+
+                        text = None
+                        while not transcript_queue.empty():
+                            text = transcript_queue.get_nowait()
+
+                        if text is None:
+                            if state == State.ACTIVE:
+                                has_words = len(command_buffer) > 0
+                                if has_words and (time.time() - last_text_time) > self.cfg.silence_timeout:
+                                    await self.handle_command(" ".join(command_buffer).strip())
+                                    command_buffer.clear()
+                                    state = State.IDLE
+                                    await ws.send(json.dumps({"type": "reset"}))
+                                    print(f"Listening for wake phrase '{self.cfg.wake_phrase}'...")
+                                elif (not has_words) and (time.time() - wake_time) > self.cfg.wake_timeout:
+                                    command_buffer.clear()
+                                    state = State.IDLE
+                                    await ws.send(json.dumps({"type": "reset"}))
+                            continue
+
+                        if state == State.IDLE:
+                            if self._contains_wake_phrase(text, self.cfg.wake_phrase):
+                                state = State.ACTIVE
+                                wake_time = time.time()
+                                last_text_time = wake_time
+                                remainder = self._strip_wake_phrase(text, self.cfg.wake_phrase)
+                                command_buffer = [remainder] if remainder else []
+                                await ws.send(json.dumps({"type": "reset"}))
+                                print("Wake phrase detected. Listening for command...")
+                        else:
+                            command_buffer.append(text)
+                            last_text_time = time.time()
+
+            recv_task = asyncio.create_task(recv_transcripts())
+            try:
+                await audio_and_logic()
+            finally:
+                recv_task.cancel()
+
+    async def handle_command(self, command_text: str):
+        if not command_text:
+            return
+
+        print(f"You said: {command_text}")
+        intent = parse_intent(command_text)
+        target_description = intent.get("target_description")
+        if not target_description:
+            print("Could not parse a target description from command.")
+            return
+
+        try:
+            objects_data = self.vision.get_objects()
+        except Exception as exc:
+            print(f"Vision API unavailable: {exc}")
+            return
+
+        labels = objects_data.get("labels", [])
+        if not labels:
+            print("No visible labels from vision right now.")
+            return
+
+        target_label = self.resolver.resolve(str(target_description), labels)
+        if not target_label:
+            print("No matching label found for intent.")
+            return
+
+        print(f"Selected label: {target_label}")
+        try:
+            self.vision.queue_plan(target_label)
+        except Exception as exc:
+            print(f"Failed to queue plan: {exc}")
+            return
+
+        arrived = await self.wait_for_arrival(target_label)
+        if not arrived:
+            print("Did not reach target waypoint before timeout.")
+            return
+
+        latest_objects = self.vision.get_objects().get("objects", [])
+        target_obj = self._best_object_by_label(latest_objects, target_label)
+        robot = self.vision.get_robot().get("robot")
+        if not target_obj:
+            print("Target object no longer visible at pickup stage.")
+            return
+
+        pickup_result = self.pickup.run(target_label, target_obj, robot or {})
+        print(f"Pickup result: {pickup_result}")
+
+    async def wait_for_arrival(self, target_label: str) -> bool:
+        deadline = time.time() + self.cfg.path_timeout_sec
+        while time.time() < deadline:
+            try:
+                path_resp = self.vision.get_path()
+                robot_resp = self.vision.get_robot()
+            except Exception:
+                await asyncio.sleep(self.cfg.poll_interval)
+                continue
+
+            path = path_resp.get("path", {})
+            robot = robot_resp.get("robot") or {}
+
+            if not path.get("active"):
+                await asyncio.sleep(self.cfg.poll_interval)
+                continue
+
+            path_target = str(path.get("target_name", ""))
+            if path_target and path_target != target_label:
+                await asyncio.sleep(self.cfg.poll_interval)
+                continue
+
+            waypoints = path.get("waypoints") or []
+            mode = path.get("mode", "")
+            if not waypoints:
+                await asyncio.sleep(self.cfg.poll_interval)
+                continue
+
+            end_x, end_y = waypoints[-1]
+            robot_point = self._robot_point_for_mode(robot, mode)
+            if robot_point is None:
+                await asyncio.sleep(self.cfg.poll_interval)
+                continue
+
+            dist = float(np.hypot(end_x - robot_point[0], end_y - robot_point[1]))
+            if mode == "cm" and dist <= self.cfg.arrival_threshold_cm:
+                print(f"Arrival reached (distance {dist:.2f} cm)")
+                return True
+            if mode == "grid" and dist <= 0.08:
+                print(f"Arrival reached (normalized distance {dist:.3f})")
+                return True
+
+            await asyncio.sleep(self.cfg.poll_interval)
+
+        return False
+
+    @staticmethod
+    def _robot_point_for_mode(robot: Dict[str, Any], mode: str) -> Optional[Tuple[float, float]]:
+        if mode == "cm":
+            pose = robot.get("pose_position_cm") or robot.get("position_cm")
+            if pose:
+                return float(pose.get("x", 0.0)), float(pose.get("y", 0.0))
+        if mode == "grid":
+            pose = robot.get("grid_position")
+            if pose:
+                return float(pose.get("x", 0.0)), float(pose.get("y", 0.0))
+        return None
+
+    @staticmethod
+    def _best_object_by_label(objects: List[Dict[str, Any]], label: str) -> Optional[Dict[str, Any]]:
+        matching = [obj for obj in objects if str(obj.get("label", "")) == label]
+        if not matching:
+            return None
+        return max(matching, key=lambda obj: float(obj.get("confidence", 0.0)))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Basic Pi voice -> plan -> pickup loop")
+    parser.add_argument(
+        "--config",
+        default=os.path.join(os.path.dirname(__file__), "pi_agent_config.json"),
+        help="Path to agent config JSON",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
+    agent = VoicePickupAgent(cfg)
+    try:
+        asyncio.run(agent.run())
+    except KeyboardInterrupt:
+        print("Shutting down agent loop.")
+
+
+if __name__ == "__main__":
+    main()
+

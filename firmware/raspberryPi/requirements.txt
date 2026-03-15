@@ -4,3 +4,7 @@ numpy
 pyserial
 fastapi
 uvicorn
+websockets
+sounddevice
+requests
+python-dotenv
