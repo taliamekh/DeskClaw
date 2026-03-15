@@ -13,7 +13,7 @@ import time
 import glob
 
 
-def _find_arduino(preferred="/dev/ttyUSB0"):
+def _find_arduino(preferred="/dev/uno_drive"):
     """Auto-detect Arduino serial port."""
     for port in [preferred] + glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
         try:
