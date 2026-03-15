@@ -26,7 +26,9 @@ print(f"Model: {MODEL_ID}")
 print(f"Text:  {TEXT}")
 print()
 
-url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+OUTPUT_FMT = "mp3_22050_32"
+
+url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?output_format={OUTPUT_FMT}"
 headers = {"xi-api-key": API_KEY, "Content-Type": "application/json"}
 payload = {
     "text": TEXT,

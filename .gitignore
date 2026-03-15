@@ -13,3 +13,4 @@ OpenClaw/whisper_streaming/
 OpenClaw/output/
 OpenClaw/device_identity.json
 __pycache__/
+/OpenClaw/openclaw.json/

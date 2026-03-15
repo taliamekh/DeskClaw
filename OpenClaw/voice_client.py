@@ -102,14 +102,15 @@ def text_to_speech(text, config):
     tts_config = config["tts"]
     api_key = os.getenv("ELEVENLABS_API_KEY", tts_config.get("api_key", ""))
     voice_id = tts_config.get("voice_id", "nPczCjzI2devNBz1zQrb")
-    model_id = tts_config.get("model", "eleven_multilingual_v2")
+    model_id = tts_config.get("model", "eleven_flash_v2_5")
 
     max_len = tts_config.get("max_speak_length", 500)
     if len(text) > max_len:
         text = text[:max_len].rsplit(" ", 1)[0] + "…"
         logger.info("Truncated TTS text to %d chars", len(text))
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    output_format = tts_config.get("output_format", "mp3_22050_32")
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format={output_format}"
     headers = {
         "xi-api-key": api_key,
         "Content-Type": "application/json",
@@ -123,7 +124,7 @@ def text_to_speech(text, config):
         },
     }
 
-    logger.info("TTS request: %d chars, voice=%s, model=%s", len(text), voice_id, model_id)
+    logger.info("TTS request: %d chars, voice=%s, model=%s, fmt=%s", len(text), voice_id, model_id, output_format)
     resp = requests.post(url, json=payload, headers=headers, timeout=(10, 60))
     resp.raise_for_status()
 
