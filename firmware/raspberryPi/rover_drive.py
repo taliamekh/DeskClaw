@@ -17,8 +17,8 @@ import time
 
 # Pin definitions
 ENA = 13
-IN1 = 22
-IN2 = 27
+IN1 = 27
+IN2 = 17
 IN3 = 23
 IN4 = 24
 ENB = 12
