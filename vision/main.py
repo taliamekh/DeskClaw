@@ -12,6 +12,7 @@ from path_planning import (
     compute_waypoint_headings,
     plan_path_astar,
     select_target_detection,
+    simplify_waypoints,
 )
 from yolo_detection import detect_objects
 
@@ -19,6 +20,11 @@ from yolo_detection import detect_objects
 latest_interpretation = ""
 interpretation_lock = threading.Lock()
 command_queue = queue.Queue()
+
+OBSTACLE_PADDING_CM = 10.0
+TARGET_STANDOFF_CM = 10.0
+ROBOT_START_STANDOFF_CM = 10.0
+WAYPOINT_MIN_SPACING_CM = 8.0
 
 
 def default_path_state():
@@ -162,6 +168,48 @@ def remove_aruco_marker_detections(detections, grid_state):
     return filtered
 
 
+def bbox_iou(box_a, box_b):
+    """Compute IoU between two [x1, y1, x2, y2] boxes."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter_area
+
+    if union <= 0.0:
+        return 0.0
+    return inter_area / union
+
+
+def suppress_overlapping_detections(detections, iou_threshold=0.55):
+    """Class-agnostic NMS: keep highest-confidence detection among overlapping boxes."""
+    if not detections:
+        return detections
+
+    sorted_detections = sorted(detections, key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+    kept = []
+
+    for candidate in sorted_detections:
+        candidate_box = candidate["bbox"]
+        overlaps_existing = any(
+            bbox_iou(candidate_box, existing["bbox"]) >= iou_threshold for existing in kept
+        )
+        if not overlaps_existing:
+            kept.append(candidate)
+
+    return kept
+
+
 def get_planning_mode_and_homography(grid_state):
     if grid_state.get("world_homography_cm") is not None:
         return "cm", grid_state["world_homography_cm"]
@@ -226,7 +274,7 @@ def get_detection_point_for_mode(detection, mode):
 
 def build_obstacles(detections, target_detection, mode, coord_homography):
     obstacles = []
-    inflate = 4.0 if mode == "cm" else 0.08
+    inflate = OBSTACLE_PADDING_CM if mode == "cm" else 0.10
 
     for detection in detections:
         if detection is target_detection:
@@ -252,8 +300,7 @@ def detection_radius_in_mode(detection, mode, coord_homography):
     diag_coord = transform_points([(x1, y1), (x2, y2)], coord_homography)
     width = abs(float(diag_coord[1][0] - diag_coord[0][0]))
     height = abs(float(diag_coord[1][1] - diag_coord[0][1]))
-    base = max(width, height) * 0.5
-    return base + (4.0 if mode == "cm" else 0.08)
+    return max(width, height) * 0.5
 
 
 def draw_stored_path(frame, path_state, grid_state):
@@ -289,7 +336,8 @@ def draw_stored_path(frame, path_state, grid_state):
         cv2.polylines(frame, [points_int], False, (255, 0, 255), 2)
 
     for idx, p in enumerate(points_int):
-        px, py = int(p[0][0]), int(p[0][1])
+        point = np.asarray(p).reshape(-1)
+        px, py = int(point[0]), int(point[1])
         cv2.circle(frame, (px, py), 4, (255, 0, 255), -1)
 
         if idx < len(headings):
@@ -423,6 +471,7 @@ while True:
             grid_state["world_homography_cm"],
         )
         detections = remove_aruco_marker_detections(detections, grid_state)
+        detections = suppress_overlapping_detections(detections)
 
         robot = grid_state.get("robot")
         mode, coord_homography = get_planning_mode_and_homography(grid_state)
@@ -438,9 +487,9 @@ while True:
                     resolution = 3.0 if mode == "cm" else 0.04
 
                     # Plan from slightly ahead of robot and stop before target object's box.
-                    start_offset = 8.0 if mode == "cm" else 0.08
+                    start_offset = ROBOT_START_STANDOFF_CM if mode == "cm" else 0.10
                     target_stop_offset = detection_radius_in_mode(target_detection, mode, coord_homography)
-                    target_stop_offset += 6.0 if mode == "cm" else 0.06
+                    target_stop_offset += TARGET_STANDOFF_CM if mode == "cm" else 0.10
                     planning_start, planning_goal = adjust_endpoints_for_standoff(
                         robot_point,
                         target_point,
@@ -449,19 +498,32 @@ while True:
                         goal_offset=target_stop_offset,
                     )
 
-                    waypoints = plan_path_astar(
+                    raw_waypoints = plan_path_astar(
                         planning_start,
                         planning_goal,
                         obstacles,
                         bounds,
                         resolution=resolution,
                     )
+                    min_spacing = WAYPOINT_MIN_SPACING_CM if mode == "cm" else 0.08
+                    waypoints = simplify_waypoints(raw_waypoints, min_spacing=min_spacing)
 
                     if waypoints:
                         waypoint_headings = compute_waypoint_headings(
                             waypoints,
                             fallback_heading=float(robot.get("heading_deg", 0.0)) if robot else 0.0,
                         )
+
+                        # Force final pose to face the true target center, not just the previous segment.
+                        if waypoint_headings and target_point is not None:
+                            end_x, end_y = waypoints[-1]
+                            to_target_x = float(target_point[0]) - float(end_x)
+                            to_target_y = float(target_point[1]) - float(end_y)
+                            if abs(to_target_x) > 1e-6 or abs(to_target_y) > 1e-6:
+                                waypoint_headings[-1] = float(
+                                    np.degrees(np.arctan2(to_target_y, to_target_x))
+                                )
+
                         path_state = {
                             "active": True,
                             "target_name": requested_target_name,
