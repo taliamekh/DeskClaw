@@ -1,6 +1,13 @@
 import cv2
 import threading
 import time
+import subprocess
+import re
+import platform
+
+# Detect operating system
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
 
 # Global variables for audio
 audio_level = 0
@@ -38,67 +45,323 @@ def detect_objects_simple(frame):
     
     return detections
 
-def audio_monitor():
+def audio_test_pyaudio():
+    """Test microphone using PyAudio with cross-platform support"""
     global audio_level, audio_active, mic_available
-
-    import pyaudio
-    import numpy as np
-
-    CHUNK = 1024
-    FORMAT = pyaudio.paInt16
-    CHANNELS = 1
-    RATE = 44100
-
+    
     try:
+        import pyaudio
+        import numpy as np
+        
+        print("\n=== PYAUDIO INITIALIZATION ===")
+        
+        # Initialize PyAudio
         p = pyaudio.PyAudio()
-
-        # Find USB microphone automatically
-        device_index = None
-        for i in range(p.get_device_count()):
-            info = p.get_device_info_by_index(i)
-            if info["maxInputChannels"] > 0:
-                print(f"Input device {i}: {info['name']}")
-                if "USB" in info["name"] or "Camera" in info["name"] or "Audio" in info["name"]:
-                    device_index = i
-
-        # fallback to default input
-        if device_index is None:
-            device_index = p.get_default_input_device_info()["index"]
-
-        print(f"Using audio device index: {device_index}")
-
-        stream = p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            input_device_index=device_index,
-            frames_per_buffer=CHUNK
-        )
-
+        
+        # List available audio devices
+        print("Available audio devices:")
+        device_count = p.get_device_count()
+        input_devices = []
+        
+        for i in range(device_count):
+            try:
+                device_info = p.get_device_info_by_index(i)
+                if device_info['maxInputChannels'] > 0:
+                    input_devices.append((i, device_info))
+                    print(f"  Device {i}: {device_info['name']} (channels: {device_info['maxInputChannels']})")
+            except Exception as e:
+                print(f"  Device {i}: Error - {e}")
+        
+        if not input_devices:
+            print("No input devices found!")
+            p.terminate()
+            if IS_LINUX:
+                audio_test_alsa()
+            else:
+                print("No audio fallback available on Windows")
+                mic_available = False
+            return
+        
+        # Try to find the best input device
+        selected_device = None
+        
+        # Prefer USB audio devices or devices with "microphone" in name
+        for device_id, device_info in input_devices:
+            device_name = device_info['name'].lower()
+            if 'usb' in device_name or 'microphone' in device_name or 'audio' in device_name:
+                selected_device = device_id
+                print(f"Selected audio device: {device_info['name']}")
+                break
+        
+        # Fall back to default input device
+        if selected_device is None:
+            try:
+                default_device = p.get_default_input_device_info()
+                selected_device = default_device['index']
+                print(f"Using default input device: {default_device['name']}")
+            except Exception:
+                # Use first available input device
+                selected_device = input_devices[0][0]
+                print(f"Using first available device: {input_devices[0][1]['name']}")
+        
+        # Get device info for selected device
+        device_info = p.get_device_info_by_index(selected_device)
+        
+        # Try different sample rates (Windows can be picky)
+        sample_rates = [44100, 48000, 22050, 16000, 8000]
+        stream = None
+        
+        for rate in sample_rates:
+            try:
+                print(f"Trying sample rate: {rate} Hz")
+                stream = p.open(format=pyaudio.paInt16,
+                               channels=1,
+                               rate=rate,
+                               input=True,
+                               input_device_index=selected_device,
+                               frames_per_buffer=1024)
+                
+                print(f"✓ Successfully opened stream at {rate} Hz")
+                break
+                
+            except Exception as e:
+                print(f"✗ Failed at {rate} Hz: {e}")
+                if stream:
+                    stream.close()
+                    stream = None
+        
+        if stream is None:
+            print("Failed to open audio stream with any sample rate")
+            p.terminate()
+            mic_available = False
+            return
+        
         mic_available = True
-        print("Microphone initialized")
-
+        print("✓ Microphone initialized successfully with PyAudio")
+        print("=== PYAUDIO INITIALIZATION COMPLETE ===\n")
+        
+        # Main audio monitoring loop
         while audio_active:
-            data = stream.read(CHUNK, exception_on_overflow=False)
-
-            samples = np.frombuffer(data, dtype=np.int16)
-
-            # compute RMS volume
-            rms = np.sqrt(np.mean(samples.astype(np.float32)**2))
-
-            # normalize to 0–100
-            audio_level = min(int(rms / 200), 100)
-
-            time.sleep(0.03)
-
+            try:
+                # Read audio data
+                data = stream.read(1024, exception_on_overflow=False)
+                
+                # Convert to numpy array
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                
+                # Calculate RMS (Root Mean Square) for audio level
+                rms = np.sqrt(np.mean(audio_data**2))
+                
+                # Normalize to 0-100 scale (adjusted for better sensitivity)
+                audio_level = min(int(rms / 50), 100)
+                
+            except Exception as e:
+                print(f"Audio read error: {e}")
+                audio_level = 0
+            
+            time.sleep(0.05)  # 50ms update rate
+        
+        # Cleanup
         stream.stop_stream()
         stream.close()
         p.terminate()
-
+        print("PyAudio cleaned up")
+        
+    except ImportError:
+        print("PyAudio not available")
+        if IS_LINUX:
+            print("Trying ALSA fallback...")
+            audio_test_alsa()
+        else:
+            print("No audio fallback available on Windows")
+            mic_available = False
     except Exception as e:
-        print("Microphone error:", e)
+        print(f"PyAudio initialization failed: {e}")
+        if IS_LINUX:
+            print("Falling back to ALSA method")
+            audio_test_alsa()
+        else:
+            print("No audio fallback available on Windows")
+            mic_available = False
+
+def audio_test_alsa():
+    """Test microphone using ALSA (Linux only)"""
+    global audio_level, audio_active, mic_available
+    
+    if IS_WINDOWS:
+        print("ALSA not available on Windows")
         mic_available = False
+        return
+    
+    print("\n=== AUDIO DEBUGGING (ALSA) ===")
+    
+    # Check if ALSA tools are available
+    try:
+        subprocess.run(['which', 'arecord'], check=True, capture_output=True)
+        print("✓ arecord command is available")
+    except Exception:
+        print("✗ arecord command not found")
+        print("Install with: sudo apt-get install alsa-utils")
+        mic_available = False
+        return
+    
+    # Try to find working audio device
+    devices_to_test = ['default', 'plughw:0,0', 'plughw:1,0', 'hw:0,0', 'hw:1,0']
+    working_device = None
+    
+    for device in devices_to_test:
+        try:
+            cmd = ['arecord', '-D', device, '-d', '0.1', '-f', 'S16_LE', '-r', '44100', '-c', '1', '-t', 'raw']
+            result = subprocess.run(cmd, capture_output=True, timeout=2)
+            
+            if result.returncode == 0 and len(result.stdout) > 0:
+                working_device = device
+                print(f"✓ Found working audio device: {device}")
+                break
+        except Exception:
+            continue
+    
+    if not working_device:
+        print("✗ No working audio device found")
+        mic_available = False
+        return
+    
+    mic_available = True
+    print(f"✓ Using audio device: {working_device}")
+    print("=== AUDIO DEBUGGING COMPLETE ===\n")
+    
+    # Audio monitoring loop
+    try:
+        while audio_active:
+            try:
+                cmd = ['arecord', '-D', working_device, '-d', '0.1', '-f', 'S16_LE', '-r', '44100', '-c', '1', '-t', 'raw']
+                result = subprocess.run(cmd, capture_output=True, timeout=2)
+                
+                if result.returncode == 0 and len(result.stdout) > 0:
+                    data = result.stdout
+                    if len(data) > 0:
+                        try:
+                            samples = []
+                            for i in range(0, len(data)-1, 2):
+                                if i+1 < len(data):
+                                    sample = int.from_bytes(data[i:i+2], 'little', signed=True)
+                                    samples.append(abs(sample))
+                            
+                            if samples:
+                                avg_amplitude = sum(samples) / len(samples)
+                                audio_level = min(int(avg_amplitude / 300), 100)
+                            else:
+                                audio_level = 0
+                        except Exception:
+                            audio_level = 0
+                    else:
+                        audio_level = 0
+                else:
+                    audio_level = 0
+                    
+            except Exception:
+                audio_level = 0
+            
+            time.sleep(0.1)
+            
+    except Exception as e:
+        print(f"Audio monitoring error: {e}")
+        mic_available = False
+
+def manual_microphone_test():
+    """Manual microphone test with cross-platform support"""
+    print("\n=== MANUAL MICROPHONE TEST ===")
+    
+    # Step 1: Test PyAudio
+    print("1. Testing PyAudio...")
+    try:
+        import pyaudio
+        import numpy as np
+        
+        p = pyaudio.PyAudio()
+        device_count = p.get_device_count()
+        
+        print(f"PyAudio found {device_count} audio devices:")
+        input_devices = []
+        
+        for i in range(device_count):
+            try:
+                device_info = p.get_device_info_by_index(i)
+                if device_info['maxInputChannels'] > 0:
+                    input_devices.append((i, device_info))
+                    print(f"  ✓ Device {i}: {device_info['name']}")
+                    print(f"    Channels: {device_info['maxInputChannels']}, Rate: {device_info['defaultSampleRate']}")
+            except Exception as e:
+                print(f"  ✗ Device {i}: Error - {e}")
+        
+        if input_devices:
+            print(f"\nTesting first input device...")
+            device_id, device_info = input_devices[0]
+            
+            # Try different sample rates
+            sample_rates = [44100, 48000, 22050, 16000]
+            for rate in sample_rates:
+                try:
+                    print(f"Testing {rate} Hz...")
+                    stream = p.open(format=pyaudio.paInt16,
+                                   channels=1,
+                                   rate=rate,
+                                   input=True,
+                                   input_device_index=device_id,
+                                   frames_per_buffer=1024)
+                    
+                    # Test recording for 0.5 seconds
+                    frames = []
+                    for _ in range(int(rate / 1024 * 0.5)):
+                        data = stream.read(1024)
+                        frames.append(data)
+                    
+                    stream.stop_stream()
+                    stream.close()
+                    
+                    # Analyze the audio
+                    audio_data = np.frombuffer(b''.join(frames), dtype=np.int16)
+                    rms = np.sqrt(np.mean(audio_data**2))
+                    
+                    print(f"✓ SUCCESS at {rate} Hz: RMS level: {rms:.2f}")
+                    if rms > 50:
+                        print("  Audio level detected - microphone is working!")
+                    else:
+                        print("  Low audio level - try speaking into microphone")
+                    
+                    p.terminate()
+                    return device_id
+                    
+                except Exception as e:
+                    print(f"✗ FAILED at {rate} Hz: {e}")
+                    if 'stream' in locals():
+                        stream.close()
+        
+        p.terminate()
+        
+    except ImportError:
+        print("PyAudio not available")
+    except Exception as e:
+        print(f"PyAudio test failed: {e}")
+    
+    # Step 2: Platform-specific tests
+    if IS_LINUX:
+        print("\n2. Checking Linux audio devices...")
+        try:
+            result = subprocess.run(['arecord', '-l'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                print("ALSA devices:")
+                print(result.stdout)
+            else:
+                print("No ALSA devices found")
+        except Exception as e:
+            print(f"Error checking ALSA: {e}")
+    elif IS_WINDOWS:
+        print("\n2. Windows audio system detected")
+        print("Make sure your microphone is enabled in Windows Sound settings")
+    
+    print("\n=== MANUAL TEST COMPLETE ===")
+    return None
 
 def draw_detections(frame, detections):
     """Draw bounding boxes on detected objects"""
@@ -161,19 +424,20 @@ def main():
     print("OpenClaw Camera & Microphone Test with Object Detection")
     print("=" * 50)
     
-    # Test imports
+    # Test imports and show platform info
+    print(f"Platform: {platform.system()} {platform.release()}")
     print("Testing dependencies...")
     try:
         import pyaudio
         print("✓ PyAudio available")
     except ImportError:
-        print("✗ PyAudio not available - will use ALSA fallback")
+        print("✗ PyAudio not available - install with: pip install pyaudio")
     
     try:
         import numpy as np
         print("✓ NumPy available")
     except ImportError:
-        print("✗ NumPy not available - audio processing may be limited")
+        print("✗ NumPy not available")
     
     print("✓ OpenCV available")
     print("=" * 50)
@@ -204,7 +468,7 @@ def main():
     # Start audio test in separate thread
     mic_enabled = True
     detection_enabled = True
-    audio_thread = threading.Thread(target=audio_monitor, daemon=True)
+    audio_thread = threading.Thread(target=audio_test_pyaudio, daemon=True)
     audio_thread.start()
     
     frame_count = 0
@@ -271,21 +535,22 @@ def main():
             print(f"Screenshot saved: {filename}")
         elif key == ord('i'):  # System info
             print("\n=== SYSTEM INFO ===")
+            print(f"Platform: {platform.system()} {platform.release()}")
             print(f"OpenCV version: {cv2.__version__}")
             print(f"Camera resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
             print(f"Camera FPS: {cap.get(cv2.CAP_PROP_FPS)}")
             print(f"Microphone available: {mic_available}")
             print(f"Current audio level: {audio_level}%")
-            
-            # Check audio devices
-            try:
-                result = subprocess.run(['arecord', '-l'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    print("Audio devices:")
-                    print(result.stdout)
-            except Exception:
-                print("Could not list audio devices")
             print("==================\n")
+        elif key == ord('t'):  # Manual microphone test
+            print("Running detailed microphone test...")
+            working_device = manual_microphone_test()
+            if working_device:
+                print(f"\n✓ Found working device: {working_device}")
+                print("You can try restarting the application to use this device.")
+            else:
+                print("\n✗ No working microphone device found.")
+                print("Check the troubleshooting steps above.")
     
     # Cleanup
     audio_active = False
