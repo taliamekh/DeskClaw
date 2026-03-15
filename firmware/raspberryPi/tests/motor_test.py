@@ -48,6 +48,31 @@ KEYS = {
     'd': (1, 0, 0, 1, "RIGHT"),
 }
 
+def test_right_motor():
+    """Pulse right motor pins directly to diagnose IN3/IN4."""
+    print("=== RIGHT MOTOR DIAGNOSTIC ===")
+    print("ENB HIGH...")
+    GPIO.output(ENB, GPIO.HIGH)
+    import time
+    time.sleep(0.5)
+    print("IN3 HIGH (right motor forward)...")
+    GPIO.output(IN3, GPIO.HIGH)
+    GPIO.output(IN4, GPIO.LOW)
+    time.sleep(3)
+    print("IN4 HIGH (right motor backward)...")
+    GPIO.output(IN3, GPIO.LOW)
+    GPIO.output(IN4, GPIO.HIGH)
+    time.sleep(3)
+    stop()
+    print("Done. If no movement, check ENB wiring on pin 12.")
+
+import sys
+if '--diag' in sys.argv:
+    setup()
+    test_right_motor()
+    GPIO.cleanup()
+    raise SystemExit
+
 setup()
 print("WASD motor control — max speed")
 print("w=forward  s=backward  a=left  d=right  space=stop  q=quit\n")

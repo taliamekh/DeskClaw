@@ -1,0 +1,6 @@
+RPi.GPIO
+opencv-python
+numpy
+pyserial
+fastapi
+uvicorn
