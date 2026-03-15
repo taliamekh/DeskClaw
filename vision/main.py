@@ -1,6 +1,10 @@
 import queue
 import threading
 import time
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -25,6 +29,8 @@ OBSTACLE_PADDING_CM = 10.0
 TARGET_STANDOFF_CM = 10.0
 ROBOT_START_STANDOFF_CM = 10.0
 WAYPOINT_MIN_SPACING_CM = 8.0
+API_HOST = os.getenv("VISION_API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("VISION_API_PORT", "8787"))
 
 
 def default_path_state():
@@ -41,6 +47,182 @@ def default_path_state():
 def load_path_state():
     # Runtime-only cache: path exists only while this process is running.
     return default_path_state()
+
+
+api_state_lock = threading.Lock()
+api_state = {
+    "objects": [],
+    "robot": None,
+    "path": default_path_state(),
+    "grid_locked": False,
+    "timestamp": 0.0,
+}
+
+
+def _json_reply(handler, payload, status=200):
+    body = json.dumps(payload).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class VisionApiHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = urlparse(self.path).path
+        with api_state_lock:
+            snapshot = {
+                "objects": list(api_state.get("objects", [])),
+                "robot": api_state.get("robot"),
+                "path": dict(api_state.get("path", {})),
+                "grid_locked": bool(api_state.get("grid_locked", False)),
+                "timestamp": float(api_state.get("timestamp", 0.0)),
+            }
+
+        if path in {"/objects", "/api/objects"}:
+            labels = []
+            seen = set()
+            for item in snapshot["objects"]:
+                label = item.get("label", "object")
+                if label not in seen:
+                    seen.add(label)
+                    labels.append(label)
+            _json_reply(
+                self,
+                {
+                    "type": "objects",
+                    "labels": labels,
+                    "objects": snapshot["objects"],
+                    "count": len(snapshot["objects"]),
+                    "grid_locked": snapshot["grid_locked"],
+                    "timestamp": snapshot["timestamp"],
+                },
+            )
+            return
+
+        if path in {"/robot", "/api/robot"}:
+            _json_reply(
+                self,
+                {
+                    "type": "robot",
+                    "robot": snapshot["robot"],
+                    "grid_locked": snapshot["grid_locked"],
+                    "timestamp": snapshot["timestamp"],
+                },
+            )
+            return
+
+        if path in {"/path", "/api/path"}:
+            _json_reply(
+                self,
+                {
+                    "type": "path",
+                    "path": snapshot["path"],
+                    "grid_locked": snapshot["grid_locked"],
+                    "timestamp": snapshot["timestamp"],
+                },
+            )
+            return
+
+        _json_reply(
+            self,
+            {
+                "error": "not_found",
+                "available": ["/objects", "/robot", "/path"],
+            },
+            status=404,
+        )
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in {"/plan", "/api/plan"}:
+            _json_reply(
+                self,
+                {
+                    "error": "not_found",
+                    "available": ["POST /plan"],
+                },
+                status=404,
+            )
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length > 0 else b"{}"
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError:
+            _json_reply(self, {"error": "invalid_json"}, status=400)
+            return
+
+        if bool(payload.get("clear", False)):
+            command_queue.put("clear path")
+            _json_reply(self, {"ok": True, "queued": "clear path"})
+            return
+
+        target = str(payload.get("target_name", "")).strip()
+        if not target:
+            _json_reply(self, {"error": "target_name_required"}, status=400)
+            return
+
+        command_queue.put(target)
+        _json_reply(self, {"ok": True, "queued": target})
+
+    def log_message(self, format, *args):
+        # Keep the vision console focused on planning/debug prints.
+        return
+
+
+def update_api_state(detections, robot, path_state, grid_state):
+    objects = []
+    for detection in detections:
+        center = detection.get("center", (0, 0))
+        objects.append(
+            {
+                "label": str(detection.get("label", "object")),
+                "confidence": float(detection.get("confidence", 0.0)),
+                "center_px": [int(center[0]), int(center[1])],
+                "grid_position": detection.get("grid_position"),
+                "position_cm": detection.get("position_cm"),
+            }
+        )
+
+    robot_payload = None
+    if robot is not None:
+        center = robot.get("center", (0, 0))
+        robot_payload = {
+            "detected": True,
+            "inside_grid": bool(robot.get("inside_grid", False)),
+            "heading_deg": robot.get("heading_deg"),
+            "grid_position": robot.get("grid_position"),
+            "position_cm": robot.get("position_cm"),
+            "pose_position_cm": robot.get("pose_position_cm"),
+            "center_px": [int(center[0]), int(center[1])],
+        }
+
+    path_payload = {
+        "active": bool(path_state.get("active", False)),
+        "target_name": str(path_state.get("target_name", "")),
+        "mode": str(path_state.get("mode", "")),
+        "status": str(path_state.get("status", "")),
+        "waypoints": [[float(x), float(y)] for x, y in path_state.get("waypoints", [])],
+        "waypoint_headings": [float(h) for h in path_state.get("waypoint_headings", [])],
+    }
+
+    with api_state_lock:
+        api_state["objects"] = objects
+        api_state["robot"] = robot_payload
+        api_state["path"] = path_payload
+        api_state["grid_locked"] = bool(grid_state.get("locked", False))
+        api_state["timestamp"] = time.time()
+
+
+def start_api_server(host, port):
+    server = ThreadingHTTPServer((host, port), VisionApiHandler)  # type: ignore[arg-type]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 def command_input_worker(cmd_queue):
@@ -435,11 +617,13 @@ requested_target_name = ""
 
 command_thread = threading.Thread(target=command_input_worker, args=(command_queue,), daemon=True)
 command_thread.start()
+api_server = start_api_server(API_HOST, API_PORT)
 
 print("OpenClaw Vision System Started")
 print("Press 'w' to get Gemini analysis (make sure camera window is focused)")
 print("Type an object name in terminal (example: bottle) to plan a waypoint path")
 print("Type 'clear path' to remove current-session path")
+print(f"API endpoints: http://{API_HOST}:{API_PORT}/objects  /robot  /path")
 print("Press 'q' to quit")
 print("=" * 50)
 
@@ -461,6 +645,7 @@ while True:
         break
 
     grid_state = detect_grid(frame)
+    robot = grid_state.get("robot")
 
     if grid_state["locked"]:
         detections = detect_objects_in_grid_roi(frame, grid_state["polygon"])
@@ -473,7 +658,6 @@ while True:
         detections = remove_aruco_marker_detections(detections, grid_state)
         detections = suppress_overlapping_detections(detections)
 
-        robot = grid_state.get("robot")
         mode, coord_homography = get_planning_mode_and_homography(grid_state)
         if requested_target_name and mode and coord_homography is not None:
             target_detection = select_target_detection(detections, requested_target_name)
@@ -552,6 +736,7 @@ while True:
 
     current_detections = detections
     current_crop_payloads = build_detection_crops(frame, detections)
+    update_api_state(detections, robot, path_state, grid_state)
 
     status_text, status_color = draw_grid_overlay(frame, grid_state)
     frame_with_boxes = draw_detections(frame.copy(), detections)
@@ -656,5 +841,6 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+api_server.shutdown()
 print("OpenClaw Vision System Stopped")
 

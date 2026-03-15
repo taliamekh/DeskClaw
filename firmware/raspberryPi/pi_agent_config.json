@@ -1,0 +1,35 @@
+{
+  "stt": {
+	"whisper_server": "ws://YOUR_MAC_IP:8765"
+  },
+  "vision": {
+	"api_base": "http://YOUR_VISION_HOST:8787"
+  },
+  "wake": {
+	"phrase": "hey claw"
+  },
+  "audio": {
+	"sample_rate": 16000,
+	"chunk_duration": 0.5
+  },
+  "timing": {
+	"silence_timeout": 2.0,
+	"wake_timeout": 10.0,
+	"poll_interval": 0.35
+  },
+  "nav": {
+	"arrival_threshold_cm": 12.0,
+	"path_timeout_sec": 90.0
+  },
+  "llm": {
+	"api_url": "https://api.openai.com/v1/chat/completions",
+	"model": "gpt-4o-mini",
+	"api_key_env": "OPENAI_API_KEY"
+  },
+  "pickup": {
+	"dry_run": true,
+	"serial_port": "/dev/ttyUSB0",
+	"camera_index": 0
+  }
+}
+
