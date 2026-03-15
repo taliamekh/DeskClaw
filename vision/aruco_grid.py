@@ -26,7 +26,7 @@ aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
 detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-MARKER_SIZE_M = 0.0508  # 2 inches
+MARKER_SIZE_M = 0.2032  # 2 inches
 
 
 def _load_calibration():
