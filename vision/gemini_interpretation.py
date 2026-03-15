@@ -40,6 +40,7 @@ def interpret_scene(crop_payloads):
             x1, y1, x2, y2 = d["bbox"]
             center_x = int((x1 + x2) / 2)
             center_y = int((y1 + y2) / 2)
+            yolo_label = str(d.get("label", "object"))
             grid_info = ""
             if d.get("grid_position"):
                 gx = d["grid_position"]["x"]
@@ -51,7 +52,8 @@ def interpret_scene(crop_payloads):
                 wy = d["position_cm"]["y"]
                 world_info = f", world_cm: ({wx:.1f}, {wy:.1f})"
             detection_info += (
-                f"\nObject {i+1}: center at ({center_x}, {center_y}){grid_info}{world_info}, "
+                f"\nObject {i+1}: yolo_label={yolo_label}, center at ({center_x}, {center_y})"
+                f"{grid_info}{world_info}, "
                 f"confidence: {d['confidence']:.2f}"
             )
 
@@ -72,11 +74,12 @@ def interpret_scene(crop_payloads):
 
 Looking at the provided object crops (not the full scene), identify each object and respond in exactly this format:
 
-Detected: [object name] at pixel([x], [y]) grid([gx], [gy]) world_cm([wx], [wy]) - confidence: [confidence]
+Detected: [YOLO label exactly as provided] at pixel([x], [y]) grid([gx], [gy]) world_cm([wx], [wy]) - confidence: [confidence]
 Description: [one concise sentence about this object]
 
 Rules:
 - Return one Detected/Description pair per object crop.
+- For each object, the Detected name must exactly match its provided yolo_label.
 - Keep each Description to one sentence.
 - Do not include numbered lists, scene summary, recommendations, or extra text.
 """

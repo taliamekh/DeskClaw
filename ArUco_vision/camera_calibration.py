@@ -21,7 +21,7 @@ TARGET_CAPTURES = 20
 CAPTURE_INTERVAL = 1.5# e.g. a standard 8x6 checkerboard has 7x5 inner corners
 
 # Camera index
-CAMERA_INDEX = 1
+CAMERA_INDEX = 2
 
 # Where to save the calibration result
 OUTPUT_FILE = "camera_calibration.npz"  # 2.5cm default
