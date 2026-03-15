@@ -104,6 +104,11 @@ def text_to_speech(text, config):
     voice_id = tts_config.get("voice_id", "nPczCjzI2devNBz1zQrb")
     model_id = tts_config.get("model", "eleven_multilingual_v2")
 
+    max_len = tts_config.get("max_speak_length", 500)
+    if len(text) > max_len:
+        text = text[:max_len].rsplit(" ", 1)[0] + "…"
+        logger.info("Truncated TTS text to %d chars", len(text))
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
         "xi-api-key": api_key,
@@ -118,12 +123,13 @@ def text_to_speech(text, config):
         },
     }
 
-    resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    logger.info("TTS request: %d chars, voice=%s, model=%s", len(text), voice_id, model_id)
+    resp = requests.post(url, json=payload, headers=headers, timeout=(10, 60))
     resp.raise_for_status()
 
     filename = OUTPUT_DIR / f"response_{int(time.time())}.mp3"
     filename.write_bytes(resp.content)
-    logger.info("TTS saved to %s", filename)
+    logger.info("TTS saved to %s (%d bytes)", filename, len(resp.content))
     return filename
 
 
