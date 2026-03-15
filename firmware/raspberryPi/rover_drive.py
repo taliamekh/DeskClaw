@@ -1,127 +1,83 @@
 """
 OpenClaw Rover Drive Module
-Controls rover motors via L298N H-bridge on Raspberry Pi GPIO.
-No pathfinding — only exposes movement primitives to be called externally.
+Controls rover motors via Arduino over USB serial (UART).
 
-Pin mapping (ENA/ENB jumpered on L298N):
-  IN1 - GPIO 27 (left motor)
-  IN2 - GPIO 17 (left motor)
-  IN3 - GPIO 23 (right motor)
-  IN4 - GPIO 24 (right motor)
-
-Direction note (based on observed hardware behavior):
-  _set_motors maps: IN1=left_fwd, IN2=left_bwd, IN3=right_fwd, IN4=right_bwd
-  But the actual motor wiring is reversed, so movement methods
-  swap True/False to match real-world directions.
+Protocol — Pi sends an integer string terminated by newline:
+  -10 to +10  : straight (neg=backward, pos=forward, 0=stop, magnitude=speed)
+  -11 to -180 : left turn  (magnitude = sharpness)
+  +11 to +180 : right turn (magnitude = sharpness)
 """
 
-import RPi.GPIO as GPIO
+import serial
 import time
-
-# Pin definitions — CONFIRMED CORRECT, do not change
-IN1 = 27
-IN2 = 17
-IN3 = 23
-IN4 = 24
-
-DEFAULT_SPEED = 60
+import glob
 
 
-def _force_pins_low():
-    """Use lgpio directly to force all motor pins LOW.
-    Works around rpi-lgpio cleanup bug where pins stay stuck HIGH."""
-    try:
-        import lgpio
-        h = lgpio.gpiochip_open(0)
-        for pin in [IN1, IN2, IN3, IN4]:
-            lgpio.gpio_claim_output(h, pin, 0)
-            lgpio.gpio_write(h, pin, 0)
-        lgpio.gpiochip_close(h)
-    except Exception:
-        pass  # Fall through to normal GPIO setup
+def _find_arduino(preferred="/dev/ttyUSB0"):
+    """Auto-detect Arduino serial port."""
+    for port in [preferred] + glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
+        try:
+            s = serial.Serial(port, 9600, timeout=1)
+            s.close()
+            return port
+        except (serial.SerialException, OSError):
+            continue
+    return None
 
 
 class RoverDrive:
-    def __init__(self, speed=DEFAULT_SPEED):
-        self.speed = speed
-        self._setup()
+    def __init__(self, port=None):
+        self.port = port or _find_arduino()
+        if not self.port:
+            raise RuntimeError("No Arduino found. Check USB connection.")
+        self.ser = serial.Serial(self.port, 9600, timeout=1)
+        time.sleep(2)  # wait for Arduino reset
+        self.ser.read(self.ser.in_waiting or 1)  # drain startup msg
 
-    def _setup(self):
-        _force_pins_low()
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        for pin in [IN1, IN2, IN3, IN4]:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, GPIO.LOW)
+    def send(self, value):
+        """Send steering integer to Arduino. Returns Arduino response."""
+        value = max(-180, min(180, int(value)))
+        self.ser.write(f"{value}\n".encode())
+        time.sleep(0.05)
+        return self.ser.readline().decode().strip()
 
-    def _set_motors(self, left_fwd, left_bwd, right_fwd, right_bwd, speed=None):
-        GPIO.output(IN1, GPIO.HIGH if left_fwd else GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH if left_bwd else GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH if right_fwd else GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH if right_bwd else GPIO.LOW)
+    # --- Movement primitives (same interface as before) ---
 
-    # --- Movement primitives ---
-
-    def forward(self, duration=None, speed=None):
-        """Move forward. If duration given, stops after that many seconds."""
-        self._set_motors(False, True, False, True, speed)
+    def forward(self, duration=None, speed=5):
+        """Move forward. speed: 1-10."""
+        self.send(max(1, min(10, speed)))
         if duration:
             time.sleep(duration)
             self.stop()
 
-    def backward(self, duration=None, speed=None):
-        """Move backward."""
-        self._set_motors(True, False, True, False, speed)
+    def backward(self, duration=None, speed=5):
+        """Move backward. speed: 1-10."""
+        self.send(-max(1, min(10, speed)))
         if duration:
             time.sleep(duration)
             self.stop()
 
-    def turn_left(self, duration=None, speed=None):
-        """Turn left in place (right motor forward, left motor back)."""
-        self._set_motors(True, False, False, True, speed)
+    def turn_left(self, duration=None, angle=45):
+        """Turn left. angle: 11-180."""
+        self.send(-max(11, min(180, angle)))
         if duration:
             time.sleep(duration)
             self.stop()
 
-    def turn_right(self, duration=None, speed=None):
-        """Turn right in place (left motor forward, right motor back)."""
-        self._set_motors(False, True, True, False, speed)
-        if duration:
-            time.sleep(duration)
-            self.stop()
-
-    def arc_left(self, duration=None, speed=None):
-        """Gentle left arc (right motor only)."""
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH)
-        if duration:
-            time.sleep(duration)
-            self.stop()
-
-    def arc_right(self, duration=None, speed=None):
-        """Gentle right arc (left motor only)."""
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH)
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.LOW)
+    def turn_right(self, duration=None, angle=45):
+        """Turn right. angle: 11-180."""
+        self.send(max(11, min(180, angle)))
         if duration:
             time.sleep(duration)
             self.stop()
 
     def stop(self):
         """Stop all motors."""
-        for pin in [IN1, IN2, IN3, IN4]:
-            GPIO.output(pin, GPIO.LOW)
-
-    def set_speed(self, speed):
-        pass
+        self.send(0)
 
     def cleanup(self):
         self.stop()
-        _force_pins_low()
-        GPIO.cleanup()
+        self.ser.close()
 
     def __enter__(self):
         return self
