@@ -35,10 +35,12 @@ class RoverDrive:
             GPIO.output(pin, GPIO.LOW)
 
     def _set_motors(self, left_fwd, left_bwd, right_fwd, right_bwd, speed=None):
-        GPIO.output(IN1, GPIO.HIGH if left_fwd else GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH if left_bwd else GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH if right_fwd else GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH if right_bwd else GPIO.LOW)
+        # IN1/IN2 (GPIO 27/17) → right motor (inverted: HIGH=backward)
+        # IN3/IN4 (GPIO 24/23) → left motor (inverted: HIGH=backward)
+        GPIO.output(IN1, GPIO.HIGH if right_bwd else GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH if right_fwd else GPIO.LOW)
+        GPIO.output(IN3, GPIO.HIGH if left_bwd else GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH if left_fwd else GPIO.LOW)
 
     # --- Movement primitives ---
 
@@ -71,21 +73,15 @@ class RoverDrive:
             self.stop()
 
     def arc_left(self, duration=None, speed=None):
-        """Gentle left arc (right motor only)."""
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH)
-        GPIO.output(IN4, GPIO.LOW)
+        """Gentle left arc (right motor forward only)."""
+        self._set_motors(False, False, True, False, speed)
         if duration:
             time.sleep(duration)
             self.stop()
 
     def arc_right(self, duration=None, speed=None):
-        """Gentle right arc (left motor only)."""
-        GPIO.output(IN1, GPIO.HIGH)
-        GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.LOW)
+        """Gentle right arc (left motor forward only)."""
+        self._set_motors(True, False, False, False, speed)
         if duration:
             time.sleep(duration)
             self.stop()
