@@ -16,8 +16,8 @@ import time
 # Pin definitions
 IN1 = 27
 IN2 = 17
-IN3 = 24  # swapped to test
-IN4 = 23  # swapped to test
+IN3 = 23  # swapped to test
+IN4 = 24  # swapped to test
 
 DEFAULT_SPEED = 60
 
@@ -35,15 +35,10 @@ class RoverDrive:
             GPIO.output(pin, GPIO.LOW)
 
     def _set_motors(self, left_fwd, left_bwd, right_fwd, right_bwd, speed=None):
-        # Actual wiring (verified by testing):
-        # IN2 (GPIO 17) = OUT1/2 (left motor) forward
-        # IN1 (GPIO 27) = OUT1/2 (left motor) backward
-        # IN4 (GPIO 23) = OUT3/4 (right motor) forward
-        # IN3 (GPIO 24) = OUT3/4 (right motor) backward
-        GPIO.output(IN1, GPIO.HIGH if left_bwd else GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH if left_fwd else GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH if right_bwd else GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH if right_fwd else GPIO.LOW)
+        GPIO.output(IN1, GPIO.HIGH if left_fwd else GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH if left_bwd else GPIO.LOW)
+        GPIO.output(IN3, GPIO.HIGH if right_fwd else GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH if right_bwd else GPIO.LOW)
 
     # --- Movement primitives ---
 
@@ -76,15 +71,21 @@ class RoverDrive:
             self.stop()
 
     def arc_left(self, duration=None, speed=None):
-        """Gentle left arc (right motor forward only)."""
-        self._set_motors(False, False, True, False, speed)
+        """Gentle left arc (right motor only)."""
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.LOW)
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
         if duration:
             time.sleep(duration)
             self.stop()
 
     def arc_right(self, duration=None, speed=None):
-        """Gentle right arc (left motor forward only)."""
-        self._set_motors(True, False, False, False, speed)
+        """Gentle right arc (left motor only)."""
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.LOW)
         if duration:
             time.sleep(duration)
             self.stop()
