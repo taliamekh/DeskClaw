@@ -52,6 +52,50 @@ def compute_waypoint_headings(path: Sequence[Point], fallback_heading: float = 0
     return headings
 
 
+def simplify_waypoints(
+    path: Sequence[Point],
+    min_spacing: float,
+    collinear_tolerance_deg: float = 12.0,
+) -> List[Point]:
+    """Reduce waypoint count by dropping very close and near-collinear intermediate points."""
+    if len(path) <= 2:
+        return list(path)
+
+    min_spacing = max(float(min_spacing), 0.0)
+    simplified: List[Point] = [path[0]]
+
+    for i in range(1, len(path) - 1):
+        prev_kept = simplified[-1]
+        curr = path[i]
+        nxt = path[i + 1]
+
+        if math.hypot(curr[0] - prev_kept[0], curr[1] - prev_kept[1]) < min_spacing:
+            continue
+
+        v1x = curr[0] - prev_kept[0]
+        v1y = curr[1] - prev_kept[1]
+        v2x = nxt[0] - curr[0]
+        v2y = nxt[1] - curr[1]
+        n1 = math.hypot(v1x, v1y)
+        n2 = math.hypot(v2x, v2y)
+
+        if n1 > 1e-6 and n2 > 1e-6:
+            dot = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (n1 * n2)))
+            turn_deg = math.degrees(math.acos(dot))
+            if turn_deg <= collinear_tolerance_deg:
+                continue
+
+        simplified.append(curr)
+
+    final_point = path[-1]
+    if math.hypot(final_point[0] - simplified[-1][0], final_point[1] - simplified[-1][1]) < (min_spacing * 0.5):
+        simplified[-1] = final_point
+    else:
+        simplified.append(final_point)
+
+    return simplified
+
+
 def select_target_detection(detections: Sequence[Dict], target_name: str) -> Optional[Dict]:
     """Return the highest-confidence detection whose label matches the requested target name."""
     target = target_name.strip().lower()
